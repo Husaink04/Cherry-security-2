@@ -1,6 +1,6 @@
 # CherrySecurity — Team onboarding and setup runbook
 
-Last verified: 2026-10-16. This records observed facts separately from planned deployment. Read the PRD for requirements and the M0 plan for implementation detail.
+Last verified: 2026-10-16. M0 is deployed and verified. Read the PRD for requirements and the verification report for acceptance evidence.
 
 ## 1. Project and current milestone
 
@@ -24,7 +24,7 @@ See [PRD v0.3](PRD.md) and [M0 plan](superpowers/plans/2026-10-16-m0.md).
 | Kali VM definition | `C:\Users\husai\Documents\Virtual Machines\Kali\Kali.vmx` |
 | Guest OS / architecture | Kali GNU/Linux Rolling 2026.3 / x86_64 |
 | Guest hostname / login | `kali` / `husain` |
-| Working Windows-to-Kali address | `10.22.21.102` on TCP port 22 |
+| Working Windows-to-Kali address | `192.168.193.129` on TCP port 22, VMware NAT (VMnet8) |
 | Other observed IPv4 addresses | `10.6.6.1`, `172.17.0.1`; not used for project access |
 | Configured VM resources | Four vCPUs, 4096 MB RAM |
 | Observed guest memory | 3879 MiB total, approximately 1614 MiB available at initial check |
@@ -49,6 +49,8 @@ IP addresses, free resources, versions, usernames, and paths are specific to thi
 9. Verified passwordless SSH as `husain`. Inspected OS, memory, disk, and Docker access using read-only commands.
 10. Docker daemon access initially failed with a socket permission error. The owner ran `sudo usermod -aG docker husain`. A fresh SSH connection confirmed group membership and successful Docker daemon access.
 11. Found existing guest containers and recorded that they must be preserved. SSH is currently running but is not enabled to start automatically at boot.
+12. The original bridged connection later timed out in both directions although SSH was listening. The owner explicitly approved and applied VMware NAT (VMnet8). Verified the same SSH host identity at `192.168.193.129`; no certificate or host-key verification was bypassed.
+13. Deployed the dedicated Compose stack, applied two migrations, completed automated acceptance and restore tests, and bootstrapped the actual Product Owner through the guest terminal. Passwords were entered locally and were not stored in source.
 
 ## 4. SSH identity and connection
 
@@ -69,13 +71,13 @@ That is a private-key **path**, not a file to copy into the repository or distri
 On the current Windows account, connect from PowerShell:
 
 ```powershell
-ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" husain@10.22.21.102
+ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" husain@192.168.193.129
 ```
 
 For a noninteractive connectivity check:
 
 ```powershell
-ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" husain@10.22.21.102 'whoami; hostname; docker info --format "{{.ServerVersion}}"'
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" husain@192.168.193.129 'whoami; hostname; docker info --format "{{.ServerVersion}}"'
 ```
 
 Success means the command exits zero and shows `husain`, `kali`, and the Docker server version. Do not disable host-key verification to make a failed connection work.
@@ -115,7 +117,7 @@ df -h /
 ```
 
 - **Connection refused after reboot:** Open Kali locally and run `sudo systemctl start ssh`. Boot startup is currently disabled. The owner may choose to enable it later with `sudo systemctl enable ssh`; that has not been done during this setup.
-- **Timeout:** Confirm the VM is powered on, rediscover its IP with `hostname -I`, and inspect the current VM network/firewall. No router forwarding or VMware network-mode change was needed for the verified connection.
+- **Timeout:** Confirm the VM is powered on and rediscover its IP with `hostname -I`. This installation now uses the explicitly approved NAT adapter. Verify host identity before changing connection addresses; further network changes require approval.
 - **Host identity changed:** Compare `sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` from Kali's console before updating known hosts.
 - **Public-key permission denied:** Check the intended username, chosen private-key path, guest `authorized_keys` entry, ownership, and permissions. Do not send private keys or passwords through chat.
 - **Docker socket permission denied:** Confirm approved membership with `id`; open a new SSH session after the owner changes groups. Do not make `/var/run/docker.sock` world-writable.
@@ -123,22 +125,21 @@ df -h /
 
 Do not run `docker system prune`, stop unrelated containers, overwrite SSH configuration, or delete volumes to troubleshoot this project.
 
-## 7. Planned application deployment — not yet performed
+## 7. Running application
 
-- Keep source editable in the Windows workspace and synchronize a dedicated deployment copy into Kali. The deployment directory is not created yet.
-- Use a dedicated Compose project name, proposed `cherrysecurity-m0`, isolated from existing workloads. Do not use global container cleanup commands.
-- Run the Go API, database, migrations, simulator, and React hosting inside Kali. Do not run a duplicate backend/database on Windows.
-- Keep PostgreSQL and API private on the Compose network; expose the web service on guest loopback `127.0.0.1:8080` after checking that the port is available.
-- Initially use SSH forwarding from Windows. Once the web listener exists, the planned command is:
+- Source remains in `D:\Cherry-security`; the deployed copy is `/home/husain/cherrysecurity-m0`.
+- Compose project `cherrysecurity-m0` runs PostgreSQL, the Go API, and React hosting. Migrations run as a separate one-shot service. The simulator is invoked explicitly; it collects no real activity.
+- PostgreSQL and API remain private on the Compose network. The web service binds guest loopback `127.0.0.1:8080`.
+- Windows reaches the console through SSH forwarding:
 
   ```powershell
-  ssh -N -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" -L 127.0.0.1:8080:127.0.0.1:8080 husain@10.22.21.102
+  ssh -N -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" -L 127.0.0.1:8080:127.0.0.1:8080 husain@192.168.193.129
   ```
 
-  Then open `http://127.0.0.1:8080` on Windows. **This is a future access URL, not a running application today.** If the Windows port is occupied, choose a different local forwarding port and record it.
+  Open `http://127.0.0.1:8080` on Windows while the verified tunnel is running. Check for an existing tunnel before launching another.
 
-- Bootstrap the Product Owner with an interactively entered password. Customer organization users and device credentials are separate from Kali SSH accounts.
-- No application secrets, database volume, migration, container image, or deployed CherrySecurity service exists yet. Implementation will pin runtime versions and dependencies.
+- The initial Product Owner exists. Sign in using the email and password entered during bootstrap. Bootstrap refuses to overwrite an existing owner. Customer users and device credentials remain separate from Kali SSH accounts.
+- Database data persists in a project-owned volume; private environment credentials remain in the guest's ignored mode-600 `.env`. Never remove the volume or publish this file.
 - Assess available memory during builds because this VM also runs unrelated containers. Do not resize the VM or shut down other workloads automatically.
 
 ## 8. Current status and next action
@@ -146,15 +147,16 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 | Work | Status |
 | --- | --- |
 | PRD and brand requirements | Written; owner reviewed and requested incorporated revisions |
-| M0 implementation plan | Written; explicit plan review/execution-method selection pending |
+| M0 implementation plan | Approved and executed inline; decisions recorded in the ledger |
 | VMware discovery and host-to-guest reachability | Verified |
 | SSH host verification and key authorization | Verified |
 | Docker/Compose installation and daemon access | Verified |
-| Backend / React / PostgreSQL deployment | Not started |
-| M0 acceptance tests / backup restore | Not run |
+| Backend / React / PostgreSQL deployment | Running, schema version 2 |
+| M0 acceptance tests / backup restore | Passed; see linked verification report |
+| Actual Product Owner | Created interactively; database count verified |
 | Real Windows monitoring agent | Later milestone |
 
-Next: review the M0 plan, confirm execution inline or delegated, then build Task 1's isolated healthy stack. Infrastructure readiness does not establish product readiness.
+Use the [operations guide](M0-DEVELOPMENT.md) for repeatable commands and the [M0 results](testing/m0-results.md) for verified behavior and limits. M1 requires a separately approved Windows-agent implementation scope.
 
 ## 9. Documentation maintenance
 

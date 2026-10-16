@@ -1,0 +1,105 @@
+name: cherrysecurity-m0
+services:
+  db:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: cherryowner
+      POSTGRES_PASSWORD: ${DB_OWNER_PASSWORD:?Set DB_OWNER_PASSWORD in .env}
+      POSTGRES_DB: cherrysecurity
+      APP_DB_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD in .env}
+    volumes:
+      - database:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/10-cherrysecurity.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U cherryowner -d cherrysecurity']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 384m
+    logging: {driver: json-file, options: {max-size: 5m, max-file: '2'}}
+    networks: [default, browser-test]
+  migrate:
+    build: ./backend
+    entrypoint: [/app/migrate]
+    environment:
+      DATABASE_URL: postgres://cherryowner:${DB_OWNER_PASSWORD}@db:5432/cherrysecurity?sslmode=disable
+      GRANT_APP_ROLE: 'true'
+    depends_on:
+      db: {condition: service_healthy}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://cherryapp:${DB_APP_PASSWORD}@db:5432/cherrysecurity?sslmode=disable
+      APP_ORIGIN: ${APP_ORIGIN:-http://127.0.0.1:8080}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    mem_limit: 192m
+    logging: {driver: json-file, options: {max-size: 5m, max-file: '2'}}
+  web:
+    build: ./web
+    ports: ['127.0.0.1:${WEB_PORT:-8080}:8080']
+    depends_on: [api]
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    mem_limit: 96m
+    logging: {driver: json-file, options: {max-size: 5m, max-file: '2'}}
+  tools:
+    image: golang:1.27.2-bookworm
+    user: '1000:1000'
+    profiles: [tools]
+    working_dir: /src
+    volumes:
+      - ./backend:/src
+      - go-modules:/go/pkg/mod
+      - go-cache:/cache
+    environment:
+      TEST_DATABASE_URL: postgres://cherryowner:${DB_OWNER_PASSWORD}@db:5432/cherrysecurity_test?sslmode=disable
+      GOMAXPROCS: '2'
+      GOCACHE: /cache
+      GOPATH: /cache/gopath
+      GOMODCACHE: /go/pkg/mod
+      GODEBUG: http2client=0
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 768m
+  api-test:
+    image: cherrysecurity-m0-api
+    profiles: [browser-test]
+    environment:
+      DATABASE_URL: postgres://cherryapp:${DB_APP_PASSWORD}@db:5432/cherrysecurity_test?sslmode=disable
+      APP_ORIGIN: http://127.0.0.1:8082
+    networks:
+      browser-test:
+        aliases: [api]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+  web-test:
+    image: cherrysecurity-m0-web
+    profiles: [browser-test]
+    ports: ['127.0.0.1:8082:8080']
+    networks: [browser-test]
+    depends_on: [api-test]
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+networks:
+  browser-test:
+volumes:
+  database:
+  go-modules:
+  go-cache:

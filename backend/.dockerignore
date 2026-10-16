@@ -1,0 +1,12 @@
+.env
+.env.*
+browser-fixture.json
+simulator-state.json
+secrets
+backups
+artifacts
+*.log
+*.dump
+*.key
+*.pem
+cherrysecurity
