@@ -6,11 +6,11 @@ Status: Proposed design for user review; implementation is not authorized by thi
 
 Baseline: PRD v0.3 and M0 commit `0ab36a5` on branch `m0`.
 
-Approved work in this stage: create and commit this document only.
+Approved work in this stage: create and commit this document, including the user's approved managed-service design revision. Implementation and installation remain outside this approval.
 
 ## 1. Intended outcome
 
-Run a visible CherrySecurity Agent on the owner's existing Windows machine and report actual foreground application activity and Windows service observations to the Kali-hosted Console. Preserve organization isolation, single-use enrollment, reliable offline delivery, and low resource use. Work in small increments with recorded evidence rather than treating installation as acceptance.
+Run CherrySecurity Agent as an administrator-managed background Windows service on the owner's existing Windows machine, with no persistent application window. Keep an employee status indicator and collection notice available, and report actual foreground application activity and Windows service observations to the Kali-hosted Console. Preserve organization isolation, single-use enrollment, reliable offline delivery, and low resource use. Work in small increments with recorded evidence rather than treating installation as acceptance.
 
 The test endpoint reports Windows 11 Pro, version 10.0.26100, 64-bit. This establishes the initial reference OS only; it does not establish support for all Windows releases. Record CPU model, logical processors, physical memory, power configuration, and workload at benchmark time. Kali currently uses VMware NAT (VMnet8) at `192.168.193.129`; reverify addresses and SSH host identity before deployment.
 
@@ -34,6 +34,12 @@ Build this as one native-agent subsystem with coordinated backend and reporting 
 | Kali API and HTTPS ingress | Real enrollment, authenticated policy, ingestion and coverage, tenant-scoped reports | Existing runtime DB role; database and API ports remain private |
 
 Start the helper through an explicitly installed logon task for the selected account, using that user's interactive token and limited run level. Do not have the low-privilege service acquire user tokens or create desktop processes. If the task cannot start, heartbeat reports helper missing. Existing user tasks and services remain untouched.
+
+Configure the service for automatic delayed startup and bounded SCM crash recovery: restart after 10 seconds, 30 seconds, and 60 seconds for successive failures, then take no automatic action on further failures until the failure count resets after one failure-free day or an administrator intervenes. Include an explicit final no-action entry so SCM does not repeat the last restart action indefinitely. Do not reboot the machine or launch arbitrary recovery commands. An authorized administrator's explicit stop or uninstall must remain effective and must not be reversed by a helper, watchdog, task, or automatic reinstallation.
+
+Set an explicit service DACL: ordinary users may query status but cannot stop, pause, reconfigure, delete, change permissions, or acquire ownership through service permissions. Restrict those management operations to administrators and SYSTEM; retain only the runtime rights needed by the service identity. Elevate the control utility for management actions. Restrict modification/deletion of the helper logon task to administrators and SYSTEM while permitting its configured user to execute it. Filesystem ACLs prevent ordinary users from replacing installed binaries or modifying service state. Do not change machine-wide user rights or weaken other services' ACLs.
+
+These controls protect the service, not a process running under the employee's own identity. The employee may still terminate their session helper, sign out, disconnect the network, or power off the machine. The service continues operational heartbeat/upload where possible and reports helper missing; it must not fabricate application activity or silently run a privileged desktop collector. Local administrators and SYSTEM can disable or uninstall the product. No kernel driver, process hiding, Task Manager evasion, or anti-uninstall mechanism is introduced.
 
 The helper uses foreground-change notifications and session/power notifications, plus a one-second lightweight state check for idle detection and recovery. Obtain the executable path with only the query rights required, reduce it immediately to a basename, and never persist or transmit the path. Protected/inaccessible processes become an unknown interval. No process command lines, window titles, documents, input contents, screenshots, clipboard, audio, or video are collected.
 
@@ -81,7 +87,7 @@ Retrieve policy at startup and every 60 seconds. Persist a validated cache with 
 
 Schedules use the existing organization IANA timezone, Sunday=0, and same-day windows; unrestricted collection must be explicit. Handle daylight-saving transitions using timezone data, not a fixed UTC offset. Intersect every collected interval with allowed windows, including retrospectively finalized idle intervals. Service inventory is operational metadata and may continue outside activity hours; disclose this in the employee notice. Heartbeats and retries continue while activity collection is stopped.
 
-The employee tray indicator shows collecting, idle, locked/paused, outside schedule, offline, helper/service error, policy unavailable, or revoked. Its explanation lists application basenames and service metadata, states that browser-domain collection is not yet installed, and does not expose credentials. Missing tray/helper means desktop activity collection is unavailable, not covert fallback collection.
+The helper runs without a persistent application window. Its employee tray indicator remains available and shows collecting, idle, locked/paused, outside schedule, offline, helper/service error, policy unavailable, or revoked. Opening status/notice explains the collected fields: application basenames and service metadata, with browser-domain collection not yet installed. It never exposes credentials. Windows may place tray icons in its overflow area; the installer and notice must explain where status can be found. The employee-facing interface has no stop/uninstall controls; administrator management is separate. Missing tray/helper means desktop activity collection is unavailable, not covert fallback collection.
 
 ## 7. Durable queue, delivery, and bounded resources
 
@@ -122,7 +128,7 @@ These are intended implementation boundaries, not authorization to modify them n
 | `/home/husain/cherrysecurity-m0` | Approved source synchronization, image build/deployment, additive migration, scoped ingress and secret files after implementation approval |
 | `C:\Program Files\CherrySecurity` | Protected versioned service/helper/control binaries and non-secret installation manifest |
 | `C:\ProgramData\CherrySecurity` | ACL-protected service config, DPAPI credential blob, SQLite queue, bounded logs, scoped public CA certificate |
-| Windows SCM service `CherrySecurityAgent`, task `CherrySecurity Session Helper` | Explicit install/start/stop/uninstall actions for this endpoint only; selected user's limited logon task |
+| Windows SCM service `CherrySecurityAgent`, task `CherrySecurity Session Helper` | Automatic delayed service startup, bounded crash recovery, administrator-only management ACLs, selected user's limited logon task; scoped install/start/stop/uninstall actions |
 
 Resolve Program Files/ProgramData through Windows known-folder APIs rather than assuming C: in portable installers. Before modifying an existing installation, refuse path/reparse-point escapes, inspect ownership and existing state, and obtain approval for the concrete upgrade/replacement. No auto-update is introduced. Development binaries are unsigned and restricted to this owner's controlled test; signed installers and verified upgrade packages remain required before customer deployment. Uninstall stops only CherrySecurity resources and preserves queued data/credentials unless deletion is separately approved.
 
@@ -154,6 +160,7 @@ Official OWASP baseline checked on 2026-10-16: Top 10:2025. This is risk guidanc
 7. Force a small queue in tests; crash/restart both processes, corrupt test-only acknowledgements, expire policy, revoke test credentials, and deny storage. Demonstrate the disk cap including journal, reserved loss evidence, controlled stop, and authenticated IPC rejection.
 8. Run an eight-hour reference workload on this Windows machine. Measure combined private bytes, CPU normalized by logical processors, peaks, outbound bytes, and total disk writes at documented sampling intervals. Short smoke checks cannot satisfy the eight-hour gate. A target deviation is reported and investigated, never silently relabeled passing.
 9. Provide reproducible installation/uninstallation commands, scoped ACLs, collected-field notice, TLS renewal steps, queue/recovery procedures, and actual evidence. No customer deployment is authorized by M1 completion.
+10. As a standard user, verify service stop/pause/reconfiguration/uninstall and binary/task modification are denied, while employee status and the collection notice remain accessible without a persistent window. Verify automatic startup and bounded crash recovery using only the dedicated CherrySecurity service. Verify an administrator can stop/uninstall it without automatic resurrection. Terminate the user's helper in a controlled test and confirm missing coverage, continued service connectivity where possible, and no false activity. Record that administrator access, network loss, logout, and shutdown remain outside prevention guarantees.
 
 Human actions required later: approve the concrete implementation/deployment batch; approve Windows elevation for the dedicated service/task/directories; supply an enrollment key through the local hidden prompt; choose the primary Windows account and employee identifier; perform lock/unlock and suspend/resume; and keep the endpoint available for the declared eight-hour workload. Further firewall, certificate, service, or file deletion actions require approval covering their exact scope. Do not ask for passwords or private keys in chat.
 
@@ -163,6 +170,8 @@ Primary guidance checked during design:
 
 - [OWASP Top 10:2025](https://top10.owasp.org/2025/).
 - [Microsoft service isolation, privileges, notifications, and session 0](https://learn.microsoft.com/en-us/windows/win32/services/service-changes-for-windows-vista).
+- [Microsoft service security and access rights](https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights).
+- [Microsoft service failure actions](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actionsw).
 - [Microsoft LocalService identity](https://learn.microsoft.com/en-us/windows/win32/services/localservice-account).
 - [Microsoft named-pipe security and access rights](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
 - [Microsoft DPAPI CryptProtectData](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata).
