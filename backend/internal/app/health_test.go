@@ -21,7 +21,13 @@ func TestHealthAndUnavailableDatabase(t *testing.T) {
 
 func TestDatabaseSchemaCompatibility(t *testing.T) {
 	db, _, _, _ := setupIntegration(t)
-	if err := CheckSchema(context.Background(), db); err != nil { t.Fatal(err) }
-	if _, err := db.Exec(context.Background(), "INSERT INTO schema_migrations(version) VALUES($1)", SchemaVersion+1); err != nil { t.Fatal(err) }
-	if CheckSchema(context.Background(), db) == nil { t.Fatal("future schema must prevent application startup") }
+	if err := CheckSchema(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(context.Background(), "INSERT INTO schema_migrations(version) VALUES($1)", SchemaVersion+1); err != nil {
+		t.Fatal(err)
+	}
+	if CheckSchema(context.Background(), db) == nil {
+		t.Fatal("future schema must prevent application startup")
+	}
 }

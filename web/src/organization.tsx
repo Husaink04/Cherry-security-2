@@ -5,6 +5,8 @@ import { duration, reportDate, timestamp } from "./model";
 import type { Role } from "./model";
 import type { KeyMetadata } from "./owner";
 import { Brand, Badge, Empty, Panel, ErrorNotice } from "./ui";
+import { DeviceHealth } from "./device-health";
+import type { NativeHealth } from "./device-health";
 
 type Device = {
   id: string;
@@ -18,6 +20,8 @@ type Device = {
   helper_status: string;
   extension_status: string;
   revoked_at: string | null;
+  health: NativeHealth | null;
+  health_received_at: string | null;
 };
 type Timeline = {
   event_id: string;
@@ -232,6 +236,26 @@ export function Organization({
       setWorking(false);
     }
   }
+  async function assignEmployee(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!detail || role !== "org_admin") return;
+    const employee = String(new FormData(event.currentTarget).get("employee_id") || "").trim();
+    if (new TextEncoder().encode(employee).length > 120 || /[\x00\r\n]/.test(employee)) {
+      setError("Employee identifier must be at most 120 bytes and one line.");
+      return;
+    }
+    setWorking(true);
+    setError("");
+    try {
+      await api(`/org/devices/${detail.device.id}/employee`, "PUT", { employee_id: employee });
+      setNotice("Employee identifier saved.");
+      setRefresh((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Employee identifier could not be saved");
+    } finally {
+      setWorking(false);
+    }
+  }
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!settings) return;
@@ -246,7 +270,7 @@ export function Organization({
         collection_schedule: settings.collection_schedule,
       });
       setNotice(
-        "Collection settings saved. M0 uses fixtures; endpoint enforcement begins with the real agent.",
+        "Collection settings saved. Native agents receive the updated policy on their next refresh.",
       );
     } catch (err) {
       setError(
@@ -287,9 +311,9 @@ export function Organization({
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <Badge tone="pilot">M0 PILOT</Badge>
+          <Badge tone="pilot">M1 PILOT</Badge>
           <p>
-            Simulated observations only.
+            Simulator and native endpoints are labeled.
             <br />
             Coverage is shown explicitly.
           </p>
@@ -325,11 +349,8 @@ export function Organization({
             </span>
           </div>
           <div className="notice pilot-banner">
-            <Badge tone="pilot">SIMULATED</Badge>
-            <span>
-              This M0 workspace contains fixture telemetry. No employee
-              monitoring agent is installed.
-            </span>
+            <Badge tone="pilot">PILOT</Badge>
+            <span>Endpoint labels distinguish simulator data from native Windows observations. Check each device for collection coverage.</span>
           </div>
           <ErrorNotice message={error} />
           {notice && (
@@ -396,9 +417,7 @@ export function Organization({
                                 <strong>{device.hostname}</strong>
                                 <small className="cell-note">
                                   {device.os} ·{" "}
-                                  <span className="simulated-label">
-                                    SIMULATED
-                                  </span>
+                                  <span className="simulated-label">{device.simulated ? "SIMULATED" : "WINDOWS AGENT"}</span>
                                 </small>
                               </td>
                               <td>
@@ -437,7 +456,7 @@ export function Organization({
                     !loading && (
                       <Empty title="No endpoints enrolled yet">
                         Ask your Product Owner for an enrollment key, then run
-                        the M0 simulator in Kali.
+                        the simulator in Kali or enroll a Windows agent.
                       </Empty>
                     )
                   )}
@@ -455,7 +474,7 @@ export function Organization({
                     <Panel
                       title={detail.device.hostname}
                       description={`${detail.device.os} · Agent ${detail.device.agent_version}`}
-                      action={<Badge tone="pilot">SIMULATED</Badge>}
+                      action={<Badge tone={detail.device.simulated ? "pilot" : "green"}>{detail.device.simulated ? "SIMULATED" : "WINDOWS AGENT"}</Badge>}
                     >
                       <dl className="details">
                         <div>
@@ -475,6 +494,12 @@ export function Organization({
                           <dd>{timestamp(detail.device.last_contact)}</dd>
                         </div>
                       </dl>
+                      <DeviceHealth simulated={detail.device.simulated} connectivity={detail.device.connectivity} health={detail.device.health} receivedAt={detail.device.health_received_at} />
+                      <form onSubmit={assignEmployee}>
+                        <label htmlFor="employee-id">Employee identifier</label>
+                        <input id="employee-id" name="employee_id" key={`${detail.device.id}:${detail.device.employee_id}`} defaultValue={detail.device.employee_id} maxLength={120} disabled={role !== "org_admin" || working} />
+                        {role === "org_admin" && <button className="secondary compact" type="submit" disabled={working}>Save identifier</button>}
+                      </form>
                       {detail.sequence_gap_count > 0 && (
                         <div className="notice pilot-banner" role="status">
                           Detected sequence gaps: {detail.sequence_gap_count}.
@@ -668,7 +693,7 @@ export function Organization({
                                     />
                                   </div>
                                   <small>
-                                    {item.hostname} · SIMULATED{" "}
+                                    {item.hostname} · {item.simulated ? "SIMULATED" : "WINDOWS AGENT"}{" "}
                                     {index === 0 ? "· Most observed" : ""}
                                   </small>
                                 </div>
@@ -891,8 +916,8 @@ export function Organization({
                 </fieldset>
               </form>
               <p className="muted">
-                M0 stores policy settings; fixtures do not represent schedule
-                enforcement. Real endpoint enforcement is verified in M1. Audit
+                Simulator fixtures do not enforce schedules. Native agents apply
+                policy after refresh; check device health for gaps or errors. Audit
                 records are retained for 90 days.
               </p>
             </Panel>

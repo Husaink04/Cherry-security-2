@@ -4,8 +4,12 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $artifactDirectory = Join-Path $projectRoot 'artifacts'
 New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
 $archivePath = Join-Path $artifactDirectory 'source.tar'
-& tar.exe -cf $archivePath --exclude=.git --exclude=.env --exclude=secrets --exclude=backups --exclude=artifacts --exclude=node_modules --exclude=dist --exclude=.superpowers --exclude=simulator-state.json -C $projectRoot .
+& tar.exe -cf $archivePath --exclude=.git --exclude='.env*' --exclude=secrets --exclude=backups --exclude=artifacts --exclude=node_modules --exclude=dist --exclude=.superpowers --exclude=simulator-state.json --exclude=browser-fixture.json --exclude='*.exe' --exclude='*.test' --exclude='*.pem' --exclude='*.key' --exclude='*.crt' --exclude='*.csr' --exclude='*.p12' --exclude='*.pfx' --exclude=test-results --exclude=playwright-report -C $projectRoot .
 if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+$archiveMembers = & tar.exe -tf $archivePath
+if ($LASTEXITCODE -ne 0) { throw 'Source archive manifest failed' }
+$forbiddenMember = $archiveMembers | Where-Object { $_ -match '(^|/)(\.env[^/]*|secrets|backups|artifacts|node_modules|dist|browser-fixture\.json|simulator-state\.json|test-results|playwright-report)(/|$)|\.(exe|test|pem|key|crt|csr|p12|pfx)$' } | Select-Object -First 1
+if ($forbiddenMember) { throw 'Source archive contains excluded generated or private material' }
 $identityPath = Join-Path $env:USERPROFILE '.ssh\cherrysecurity_kali_ed25519'
 $destination = "${GuestUser}@${GuestAddress}"
 & scp.exe -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i $identityPath $archivePath "${destination}:/home/husain/cherrysecurity-m0/source.tar"

@@ -45,16 +45,17 @@ type Event struct {
 	Payload  Payload   `json:"payload"`
 }
 type Heartbeat struct {
-	Version       int    `json:"schema_version"`
-	Helper        string `json:"helper"`
-	Extension     string `json:"extension"`
-	State         string `json:"collection_state"`
-	PolicyVersion string `json:"policy_version"`
-	QueueEvents   int64  `json:"queue_events"`
-	QueueBytes    int64  `json:"queue_bytes"`
-	LostEvents    int64  `json:"lost_events"`
-	LossEpoch     string `json:"loss_epoch"`
-	LastError     string `json:"last_error"`
+	Version          int    `json:"schema_version"`
+	Helper           string `json:"helper"`
+	Extension        string `json:"extension"`
+	State            string `json:"collection_state"`
+	PolicyVersion    string `json:"policy_version"`
+	PolicyAgeSeconds int    `json:"policy_age_seconds"`
+	QueueEvents      int64  `json:"queue_events"`
+	QueueBytes       int64  `json:"queue_bytes"`
+	LostEvents       int64  `json:"lost_events"`
+	LossEpoch        string `json:"loss_epoch"`
+	LastError        string `json:"last_error"`
 }
 type Acknowledgement struct {
 	IDs []string `json:"accepted_event_ids"`

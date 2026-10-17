@@ -71,6 +71,7 @@ type nativeHealth struct {
 	Extension   string `json:"extension"`
 	State       string `json:"collection_state,omitempty"`
 	Policy      string `json:"policy_version,omitempty"`
+	PolicyAge   int    `json:"policy_age_seconds"`
 	QueueEvents int64  `json:"queue_events"`
 	QueueBytes  int64  `json:"queue_bytes"`
 	Lost        int64  `json:"lost_events"`
@@ -92,5 +93,5 @@ func validHealth(h nativeHealth) bool {
 	return collectorState(h.Helper) && collectorState(h.Extension) && h.Version == 2 &&
 		allowed(h.State, "collecting", "idle", "locked", "outside_schedule", "offline", "helper_missing", "policy_unavailable", "revoked", "error", "unsupported_session", "suspended", "logged_out") &&
 		allowed(h.Error, "none", "tls", "network", "storage", "integrity", "clock", "policy", "helper", "inventory", "credential") &&
-		len(h.Policy) <= 128 && len(h.Epoch) > 0 && len(h.Epoch) <= 128 && h.QueueEvents >= 0 && h.QueueEvents <= maxSafeInteger && h.QueueBytes >= 0 && h.QueueBytes <= 50*1024*1024 && h.Lost >= 0 && h.Lost <= maxSafeInteger
+		len(h.Policy) <= 128 && h.PolicyAge >= 0 && h.PolicyAge <= 86400 && len(h.Epoch) > 0 && len(h.Epoch) <= 128 && h.QueueEvents >= 0 && h.QueueEvents <= maxSafeInteger && h.QueueBytes >= 0 && h.QueueBytes <= 50*1024*1024 && h.Lost >= 0 && h.Lost <= maxSafeInteger
 }

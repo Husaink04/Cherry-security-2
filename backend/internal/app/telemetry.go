@@ -121,7 +121,7 @@ func (a *App) heartbeat(w http.ResponseWriter, r *http.Request, device devicePri
 		}
 		return send(w, 200, map[string]any{"status": "accepted"})
 	}
-	if (input.Version != 0 && input.Version != 1) || input.State != "" || input.Policy != "" || input.Epoch != "" || input.Error != "" || input.QueueEvents != 0 || input.QueueBytes != 0 || input.Lost != 0 {
+	if (input.Version != 0 && input.Version != 1) || input.State != "" || input.Policy != "" || input.PolicyAge != 0 || input.Epoch != "" || input.Error != "" || input.QueueEvents != 0 || input.QueueBytes != 0 || input.Lost != 0 {
 		return invalid("native heartbeat requires schema version 2")
 	}
 	tag, err := a.db.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2 WHERE id=$3 AND revoked_at IS NULL", input.Helper, input.Extension, device.ID)

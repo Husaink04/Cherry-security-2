@@ -131,3 +131,14 @@ func TestEventValidation(t *testing.T) {
 		t.Fatal("unknown sensitive field accepted")
 	}
 }
+
+func TestNativePolicyAgeBound(t *testing.T) {
+	health := nativeHealth{Version: 2, Helper: "healthy", Extension: "missing", State: "collecting", Policy: "v1", PolicyAge: 86400, Epoch: "epoch", Error: "none"}
+	if !validHealth(health) {
+		t.Fatal("valid policy age rejected")
+	}
+	health.PolicyAge = 86401
+	if validHealth(health) {
+		t.Fatal("out-of-range policy age accepted")
+	}
+}

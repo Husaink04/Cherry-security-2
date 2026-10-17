@@ -9,6 +9,10 @@ artifacts
 *.exe
 *.test
 *.pem
+*.crt
+*.csr
+*.p12
+*.pfx
 *.key
 browser-fixture.json
 test-results

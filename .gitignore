@@ -9,6 +9,10 @@ artifacts/
 *.dump
 *.key
 *.pem
+*.crt
+*.csr
+*.p12
+*.pfx
 *.sqlite*
 node_modules/
 dist/
