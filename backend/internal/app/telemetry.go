@@ -168,7 +168,7 @@ func validateEvent(event Event, now time.Time, retention int) error {
 			return invalid("invalid service payload")
 		}
 		switch p.State {
-		case "running", "stopped", "paused", "start_pending", "stop_pending", "continue_pending", "pause_pending", "unknown":
+		case "running", "stopped", "paused", "start_pending", "stop_pending", "continue_pending", "pause_pending", "unknown", "removed":
 		default:
 			return invalid("unsupported service state")
 		}

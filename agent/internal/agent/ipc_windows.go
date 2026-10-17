@@ -24,16 +24,16 @@ type SessionBinding struct {
 }
 
 func helperPipeACL(binding SessionBinding) (string, error) {
-	for _, value := range []string{binding.UserSID, binding.LogonSID, binding.ServiceSID} {
+	for _, value := range []string{binding.UserSID, binding.ServiceSID} {
 		sid, err := windows.StringToSid(value)
 		if err != nil || sid.String() != value {
 			return "", errors.New("invalid pipe identity")
 		}
 	}
-	if !strings.HasPrefix(binding.LogonSID, "S-1-5-5-") || !strings.HasPrefix(binding.ServiceSID, "S-1-5-80-") {
+	if !(strings.HasPrefix(binding.UserSID, "S-1-5-21-") || strings.HasPrefix(binding.UserSID, "S-1-12-1-")) || !strings.HasPrefix(binding.ServiceSID, "S-1-5-80-") {
 		return "", errors.New("invalid session/service SID")
 	}
-	return fmt.Sprintf("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;%s)(A;;0x100083;;;%s)", binding.ServiceSID, binding.LogonSID), nil
+	return fmt.Sprintf("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;%s)(A;;0x100083;;;%s)", binding.ServiceSID, binding.UserSID), nil
 }
 
 func pipeHandle(connection net.Conn) (windows.Handle, error) {
@@ -100,7 +100,7 @@ func verifyClientToken(identity windows.Token, binding SessionBinding) error {
 	if err != nil {
 		return err
 	}
-	if user.User.Sid.String() != binding.UserSID || session != binding.SessionID || session != windows.WTSGetActiveConsoleSessionId() || logon != binding.LogonSID {
+	if user.User.Sid.String() != binding.UserSID || session != binding.SessionID || session != windows.WTSGetActiveConsoleSessionId() || !strings.HasPrefix(logon, "S-1-5-5-") || (binding.LogonSID != "" && logon != binding.LogonSID) {
 		return errors.New("helper identity rejected")
 	}
 	return nil

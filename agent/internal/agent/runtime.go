@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 )
@@ -119,6 +120,36 @@ func (engine *Engine) UpdatePolicy(policy Policy, at time.Time) error {
 		return err
 	}
 	engine.timeline = candidate
+	return nil
+}
+
+func (engine *Engine) ObserveService(observation ServiceObservation) error {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if observation.Name == "" || len(observation.Name) > 120 || strings.ContainsAny(observation.Name, "\x00\r\n") || observation.At.IsZero() {
+		return errors.New("invalid service observation")
+	}
+	switch observation.State {
+	case "running", "stopped", "paused", "start_pending", "stop_pending", "continue_pending", "pause_pending", "unknown", "removed":
+	default:
+		return errors.New("invalid service state")
+	}
+	switch observation.StartupType {
+	case "automatic", "manual", "disabled", "unknown":
+	default:
+		return errors.New("invalid service startup type")
+	}
+	policy := engine.timeline.checkpoint.Policy
+	if observation.At.Before(policy.ServerTime.Add(-5*time.Minute)) || !observation.At.Before(policy.ServerTime.Add(time.Duration(policy.ValidForSeconds)*time.Second)) {
+		return errors.New("policy unavailable or expired")
+	}
+	checkpoint := engine.timeline.Checkpoint()
+	event := Event{ID: token(), Session: checkpoint.Session, Sequence: checkpoint.Sequence, Observed: observation.At.UTC(), Kind: "service", Payload: Payload{Service: observation.Name, State: observation.State, StartupType: observation.StartupType}}
+	checkpoint.Sequence++
+	if err := engine.queue.CommitObservation(token(), checkpoint, []Event{event}); err != nil {
+		return err
+	}
+	engine.timeline.checkpoint = checkpoint
 	return nil
 }
 

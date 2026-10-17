@@ -44,3 +44,32 @@ func TestEngineAcknowledgesOnlyDurableHelperSamples(t *testing.T) {
 		t.Fatal("helper sequence not persisted")
 	}
 }
+
+func TestEngineStoresServiceObservationAndRejectsInvalidState(t *testing.T) {
+	queue, err := OpenQueue(filepath.Join(t.TempDir(), "services.db"), QueueLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	policy := testPolicy()
+	engine, err := NewEngine(queue, policy, policy.ServerTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := ServiceObservation{Name: "Spooler", State: "running", StartupType: "automatic", At: policy.ServerTime}
+	if err := engine.ObserveService(valid); err != nil {
+		t.Fatal(err)
+	}
+	if engine.Checkpoint().Sequence != 1 || queue.Stats().Events != 1 {
+		t.Fatal("service event was not committed with sequence")
+	}
+	valid.Name = "secret\nservice"
+	if engine.ObserveService(valid) == nil {
+		t.Fatal("malformed service accepted")
+	}
+	valid.Name = "Spooler"
+	valid.At = policy.ServerTime.Add(24 * time.Hour)
+	if engine.ObserveService(valid) == nil {
+		t.Fatal("expired policy accepted service collection")
+	}
+}

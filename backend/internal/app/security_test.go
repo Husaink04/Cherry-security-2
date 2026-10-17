@@ -94,6 +94,10 @@ func TestRetentionPreservesIndependentSummaryWindow(t *testing.T) {
 
 func TestEventValidation(t *testing.T) {
 	now := time.Now().UTC()
+	removed := Event{ID: "removed", Session: "session", Sequence: 2, Observed: now, Kind: "service", Payload: Payload{Service: "Spooler", State: "removed", StartupType: "unknown"}}
+	if err := validateEvent(removed, now, 7); err != nil {
+		t.Fatalf("removed service must be reportable: %v", err)
+	}
 	valid := Event{ID: "one", Session: "session", Sequence: 1, Observed: now, Kind: "browser", Payload: Payload{Hostname: "docs.example.com", Start: now.Add(-time.Minute), End: now}}
 	if err := validateEvent(valid, now, 7); err != nil {
 		t.Fatal(err)

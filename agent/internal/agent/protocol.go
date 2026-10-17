@@ -59,3 +59,9 @@ type Heartbeat struct {
 type Acknowledgement struct {
 	IDs []string `json:"accepted_event_ids"`
 }
+type ServiceObservation struct {
+	Name        string
+	State       string
+	StartupType string
+	At          time.Time
+}

@@ -16,10 +16,10 @@ func TestPipeACLRejectsUntrustedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(descriptor, ";;;WD)") || strings.Contains(descriptor, ";;;AU)") || !strings.Contains(descriptor, binding.LogonSID) {
-		t.Fatal("pipe ACL is not session scoped")
+	if strings.Contains(descriptor, ";;;WD)") || strings.Contains(descriptor, ";;;AU)") || !strings.Contains(descriptor, binding.UserSID) || strings.Contains(descriptor, binding.LogonSID) {
+		t.Fatal("pipe ACL is not selected-user scoped")
 	}
-	binding.LogonSID = "S-1-5-5-1-2)(A;;GA;;;WD)"
+	binding.UserSID = "S-1-5-21-1-2-3-1001)(A;;GA;;;WD)"
 	if _, err = helperPipeACL(binding); err == nil {
 		t.Fatal("invalid SID injection accepted")
 	}
@@ -35,11 +35,7 @@ func TestCurrentUserNamedPipeAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logon, err := tokenLogonSID(identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding := SessionBinding{UserSID: user.User.Sid.String(), LogonSID: logon, SessionID: session, ServiceSID: "S-1-5-80-1-2-3-4-5"}
+	binding := SessionBinding{UserSID: user.User.Sid.String(), SessionID: session, ServiceSID: "S-1-5-80-1-2-3-4-5"}
 	descriptor, err := helperPipeACL(binding)
 	if err != nil {
 		t.Fatal(err)
