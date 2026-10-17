@@ -9,7 +9,7 @@ The initial deployment is accessible only through loopback SSH forwarding. Brows
 | Method and route | Access | Behavior |
 | --- | --- | --- |
 | GET `/healthz` | Public | Process liveness, independent of database |
-| GET `/readyz` | Public | 200 only with database access and supported database schema version 2 |
+| GET `/readyz` | Public | M0 deployed schema 2; M1 source requires schema 3 after its approved migration |
 | POST `/auth/login` | Public, exact Origin required | `{email,password}`; returns role, organization ID, and CSRF token; sets HttpOnly SameSite=Strict cookie |
 | GET `/auth/me` | Session | Returns role, organization ID, and session-bound CSRF token without rotating the session |
 | POST `/auth/logout` | Session + CSRF | Deletes the server session and expires its cookie |
@@ -45,7 +45,11 @@ POST `/agent/enroll`:
 }
 ```
 
-Returns `{device_id,device_token}` once. The organization comes exclusively from the key. M0 rejects real/non-simulated endpoint enrollment. Used, expired, and revoked keys return 401.
+Returns `{device_id,device_token}` once. The organization comes exclusively from the key. Deployed M0 rejects real/non-simulated enrollment; M1 source accepts and persists either explicit simulated state. Used, expired, and revoked keys return 401.
+
+M1 adds device-authenticated `GET /agent/policy`: schema version 1, stable policy hash, server UTC time, IANA timezone, idle seconds, collection schedule, raw retention and irreversible ingestion floor, upload interval 60 seconds, validity 86400 seconds. M1 native event schema 2 supports typed gap reasons while preserving schema 1 JSON/replay compatibility. Native heartbeat schema 2 reports collection/policy/queue/error/loss health; unsupported fields and counter rollback are rejected. Loss epochs are retained up to 64 per device; exceeding that bound requires explicit recovery. These source changes are not live until the separate rollout approval.
+
+M1 adds administrator-only `PUT /org/devices/{id}/employee` with `{employee_id}` (trimmed, at most 120 bytes). Assignment is tenant scoped and audited; an empty value unassigns. Product Owner and viewer roles cannot assign employee labels.
 
 After enrollment use `Authorization: Bearer <device_token>` for:
 

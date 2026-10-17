@@ -19,8 +19,8 @@ import (
 )
 
 type Config struct {
-	Origin        string
-	SecureCookies bool
+	Origin         string
+	SecureCookies  bool
 	RequestTimeout time.Duration
 }
 type App struct {
@@ -77,7 +77,9 @@ func decode(w http.ResponseWriter, r *http.Request, value any) error {
 	return nil
 }
 func New(db *pgxpool.Pool, config Config) http.Handler {
-	if config.RequestTimeout == 0 { config.RequestTimeout = 12 * time.Second }
+	if config.RequestTimeout == 0 {
+		config.RequestTimeout = 12 * time.Second
+	}
 	a := &App{db: db, config: config}
 	mux := http.NewServeMux()
 	route := func(pattern string, fn endpoint) {
@@ -122,12 +124,14 @@ func New(db *pgxpool.Pool, config Config) http.Handler {
 	route("POST /api/owner/keys/{id}/revoke", a.require("product_owner", a.revokeKey))
 	route("GET /api/org/keys", a.require("org", a.orgKeys))
 	route("POST /api/agent/enroll", a.enroll)
+	route("GET /api/agent/policy", a.device(a.agentPolicy))
 	route("POST /api/agent/heartbeat", a.device(a.heartbeat))
 	route("POST /api/agent/events", a.device(a.ingest))
 	route("GET /api/org/devices", a.require("org", a.devices))
 	route("GET /api/org/devices/{id}", a.require("org", a.deviceDetail))
 	route("GET /api/org/devices/{id}/services", a.require("org", a.services))
 	route("POST /api/org/devices/{id}/revoke", a.require("org_admin", a.revokeDevice))
+	route("PUT /api/org/devices/{id}/employee", a.require("org_admin", a.assignEmployee))
 	route("GET /api/org/reports/daily", a.require("org", a.daily))
 	route("GET /api/org/settings", a.require("org", a.getSettings))
 	route("PUT /api/org/settings", a.require("org_admin", a.updateSettings))

@@ -29,7 +29,7 @@ func (a *App) jsonRows(ctx context.Context, query string, args ...any) ([]any, e
 	return items, rows.Err()
 }
 
-const deviceJSON = `jsonb_build_object('id',d.id,'hostname',d.hostname,'employee_id',d.employee_id,'os',d.os,'agent_version',d.agent_version,'simulated',d.simulated,'created_at',d.created_at,'last_contact',d.last_contact,'revoked_at',d.revoked_at,'helper_status',d.helper_status,'extension_status',d.extension_status,'connectivity',CASE WHEN d.revoked_at IS NOT NULL THEN 'revoked' WHEN d.last_contact IS NULL THEN 'never_seen' WHEN d.last_contact<=now()-interval '5 minutes' THEN 'offline' WHEN d.last_contact<=now()-interval '3 minutes' THEN 'stale' ELSE 'online' END)`
+const deviceJSON = `jsonb_build_object('id',d.id,'hostname',d.hostname,'employee_id',d.employee_id,'os',d.os,'agent_version',d.agent_version,'simulated',d.simulated,'created_at',d.created_at,'last_contact',d.last_contact,'revoked_at',d.revoked_at,'helper_status',d.helper_status,'extension_status',d.extension_status,'health',d.health,'health_received_at',d.health_received_at,'connectivity',CASE WHEN d.revoked_at IS NOT NULL THEN 'revoked' WHEN d.last_contact IS NULL THEN 'never_seen' WHEN d.last_contact<=now()-interval '5 minutes' THEN 'offline' WHEN d.last_contact<=now()-interval '3 minutes' THEN 'stale' ELSE 'online' END)`
 
 func (a *App) devices(w http.ResponseWriter, r *http.Request, user principal) error {
 	items, err := a.jsonRows(r.Context(), "SELECT "+deviceJSON+" FROM devices d WHERE d.organization_id=$1 ORDER BY d.created_at DESC LIMIT 100", user.OrganizationID)

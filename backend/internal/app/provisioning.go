@@ -215,9 +215,6 @@ func (a *App) enroll(w http.ResponseWriter, r *http.Request) error {
 	if len(input.Hostname) < 1 || len(input.Hostname) > 120 || len(input.OS) < 1 || len(input.OS) > 120 || len(input.Version) < 1 || len(input.Version) > 40 {
 		return invalid("hostname, OS, and version required within supported limits")
 	}
-	if !input.Simulated {
-		return invalid("M0 supports simulated endpoints only")
-	}
 	tx, err := a.db.Begin(r.Context())
 	if err != nil {
 		return err
@@ -232,7 +229,7 @@ func (a *App) enroll(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	id, token := RandomToken(), RandomToken()
-	_, err = tx.Exec(r.Context(), "INSERT INTO devices(id,organization_id,hostname,os,agent_version,simulated,token_hash) VALUES($1,$2,$3,$4,$5,true,$6)", id, org, input.Hostname, input.OS, input.Version, digest(token))
+	_, err = tx.Exec(r.Context(), "INSERT INTO devices(id,organization_id,hostname,os,agent_version,simulated,token_hash) VALUES($1,$2,$3,$4,$5,$6,$7)", id, org, input.Hostname, input.OS, input.Version, input.Simulated, digest(token))
 	if err != nil {
 		return err
 	}

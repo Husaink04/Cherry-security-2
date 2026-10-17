@@ -10,13 +10,19 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 func CheckSchema(ctx context.Context, db *pgxpool.Pool) error {
-	if db == nil { return fmt.Errorf("database unavailable") }
+	if db == nil {
+		return fmt.Errorf("database unavailable")
+	}
 	var version int
-	if err := db.QueryRow(ctx, "SELECT coalesce(max(version),0) FROM schema_migrations").Scan(&version); err != nil { return err }
-	if version != SchemaVersion { return fmt.Errorf("schema version %d incompatible with required version %d", version, SchemaVersion) }
+	if err := db.QueryRow(ctx, "SELECT coalesce(max(version),0) FROM schema_migrations").Scan(&version); err != nil {
+		return err
+	}
+	if version != SchemaVersion {
+		return fmt.Errorf("schema version %d incompatible with required version %d", version, SchemaVersion)
+	}
 	return nil
 }
 
@@ -48,7 +54,7 @@ func Migrate(ctx context.Context, db *pgxpool.Pool) error {
 	if version > SchemaVersion {
 		return fmt.Errorf("unsupported database schema version %d", version)
 	}
-	files := []string{"migrations/001_initial.sql", "migrations/002_ingestion_watermark.sql"}
+	files := []string{"migrations/001_initial.sql", "migrations/002_ingestion_watermark.sql", "migrations/003_native_agent.sql"}
 	for next := version + 1; next <= SchemaVersion; next++ {
 		script, readErr := migrations.ReadFile(files[next-1])
 		if readErr != nil {
