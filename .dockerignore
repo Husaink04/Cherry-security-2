@@ -1,7 +1,15 @@
 .git
 .env
+.env.*
 secrets
 backups
 artifacts
 **/node_modules
 **/dist
+*.exe
+*.test
+*.pem
+*.key
+browser-fixture.json
+test-results
+playwright-report

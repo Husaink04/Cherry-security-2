@@ -73,6 +73,27 @@ services:
     depends_on:
       db: {condition: service_healthy}
     mem_limit: 768m
+  agent-tools:
+    image: golang:1.27.2-bookworm
+    user: '1000:1000'
+    profiles: [tools]
+    working_dir: /agent
+    volumes:
+      - ./agent:/agent
+      - ./artifacts:/artifacts
+      - go-modules:/go/pkg/mod
+      - go-cache:/cache
+    environment:
+      GOMAXPROCS: '2'
+      GOMEMLIMIT: 512MiB
+      GOGC: '25'
+      GOCACHE: /cache
+      GOPATH: /cache/gopath
+      GOMODCACHE: /go/pkg/mod
+      GODEBUG: http2client=0
+    mem_limit: 768m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
   api-test:
     image: cherrysecurity-m0-api
     profiles: [browser-test]
