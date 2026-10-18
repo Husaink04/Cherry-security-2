@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (a *App) agentPolicy(w http.ResponseWriter, r *http.Request, device devicePrincipal) error {
@@ -12,7 +14,9 @@ func (a *App) agentPolicy(w http.ResponseWriter, r *http.Request, device deviceP
 	var idle, retention int
 	var schedule json.RawMessage
 	var floor time.Time
-	err := a.db.QueryRow(r.Context(), "SELECT timezone,idle_seconds,raw_retention_days,collection_schedule,ingest_not_before FROM organizations WHERE id=$1", device.OrganizationID).Scan(&zone, &idle, &retention, &schedule, &floor)
+	err := inScope(r.Context(), a.db, device.scope(), func(tx pgx.Tx) error {
+		return tx.QueryRow(r.Context(), "SELECT timezone,idle_seconds,raw_retention_days,collection_schedule,ingest_not_before FROM organizations WHERE id=$1", device.OrganizationID).Scan(&zone, &idle, &retention, &schedule, &floor)
+	})
 	if err != nil {
 		return err
 	}
@@ -44,7 +48,7 @@ func (a *App) assignEmployee(w http.ResponseWriter, r *http.Request, user princi
 	if len(input.Employee) > 120 || strings.ContainsAny(input.Employee, "\x00\r\n") {
 		return invalid("employee identifier must be at most 120 bytes without control lines")
 	}
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}

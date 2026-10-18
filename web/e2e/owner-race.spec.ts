@@ -143,6 +143,7 @@ test("known missing event sequences are visible in endpoint coverage", async ({
     });
   });
   await page.goto("/");
+  await page.getByRole("button", { name: "Devices", exact: true }).click();
   await page.getByRole("button", { name: "View →", exact: true }).click();
   await expect(
     page.getByText("Detected sequence gaps: 2. Observations may be missing.", {

@@ -22,7 +22,7 @@ func (a *App) device(fn deviceEndpoint) endpoint {
 			return &apiError{401, "device credentials required"}
 		}
 		var device devicePrincipal
-		err := a.db.QueryRow(r.Context(), "SELECT id,organization_id FROM devices WHERE token_hash=$1 AND revoked_at IS NULL", digest(strings.TrimPrefix(authorization, "Bearer "))).Scan(&device.ID, &device.OrganizationID)
+		err := a.db.QueryRow(r.Context(), "SELECT device_id,organization_id FROM auth_device($1)", digest(strings.TrimPrefix(authorization, "Bearer "))).Scan(&device.ID, &device.OrganizationID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &apiError{401, "device credential invalid or revoked"}
 		}
@@ -69,7 +69,7 @@ func (a *App) heartbeat(w http.ResponseWriter, r *http.Request, device devicePri
 		if !validHealth(input) {
 			return invalid("invalid native heartbeat")
 		}
-		tx, err := a.db.Begin(r.Context())
+		tx, err := beginScoped(r.Context(), a.db, device.scope())
 		if err != nil {
 			return err
 		}
@@ -124,11 +124,16 @@ func (a *App) heartbeat(w http.ResponseWriter, r *http.Request, device devicePri
 	if (input.Version != 0 && input.Version != 1) || input.State != "" || input.Policy != "" || input.PolicyAge != 0 || input.Epoch != "" || input.Error != "" || input.QueueEvents != 0 || input.QueueBytes != 0 || input.Lost != 0 {
 		return invalid("native heartbeat requires schema version 2")
 	}
-	tag, err := a.db.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2 WHERE id=$3 AND revoked_at IS NULL", input.Helper, input.Extension, device.ID)
+	updated := false
+	err := inScope(r.Context(), a.db, device.scope(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2 WHERE id=$3 AND revoked_at IS NULL", input.Helper, input.Extension, device.ID)
+		updated = tag.RowsAffected() > 0
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if !updated {
 		return &apiError{401, "device revoked"}
 	}
 	return send(w, 200, map[string]any{"status": "accepted"})
@@ -226,7 +231,7 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 	if (input.Version != 1 && input.Version != 2) || len(input.Events) < 1 || len(input.Events) > 500 {
 		return invalid("schema version 1 or 2 and 1 to 500 events required")
 	}
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, device.scope())
 	if err != nil {
 		return err
 	}
@@ -328,7 +333,7 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 	return send(w, 200, map[string]any{"accepted_event_ids": accepted})
 }
 func (a *App) revokeDevice(w http.ResponseWriter, r *http.Request, user principal) error {
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}

@@ -8,7 +8,7 @@ import (
 )
 
 func TestReportTotalsAndRetentionReplayBoundary(t *testing.T) {
-	db, server, owner, login := setupIntegration(t)
+	db, runtimeDB, server, owner, login := setupIntegrationPools(t)
 	ctx := context.Background()
 	org := owner.expect("POST", "/api/owner/organizations", map[string]any{"name": "Report integrity fixtures", "timezone": "UTC"}, "", 201)["id"].(string)
 	owner.expect("POST", "/api/owner/organizations/"+org+"/admins", map[string]any{"email": "reports@example.test", "password": "Strong-report-password-2026!"}, "", 201)
@@ -50,7 +50,7 @@ func TestReportTotalsAndRetentionReplayBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = Cleanup(ctx, db, now); err != nil {
+		if err = Cleanup(ctx, runtimeDB, now); err != nil {
 			t.Fatal(err)
 		}
 		admin.expect("PUT", "/api/org/settings", map[string]any{"idle_seconds": 300, "raw_retention_days": 30, "summary_retention_days": 30, "collection_schedule": map[string]any{"unrestricted": true}}, "", 200)

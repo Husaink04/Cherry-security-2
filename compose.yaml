@@ -35,6 +35,7 @@ services:
     environment:
       DATABASE_URL: postgres://cherryapp:${DB_APP_PASSWORD}@db:5432/cherrysecurity?sslmode=disable
       APP_ORIGIN: ${APP_ORIGIN:-http://127.0.0.1:8080}
+      TRUST_PROXY_HEADER: 'true'
     depends_on:
       migrate: {condition: service_completed_successfully}
     read_only: true
@@ -117,6 +118,7 @@ services:
     environment:
       DATABASE_URL: postgres://cherryapp:${DB_APP_PASSWORD}@db:5432/cherrysecurity_test?sslmode=disable
       APP_ORIGIN: http://127.0.0.1:8082
+      TRUST_PROXY_HEADER: 'true'
     networks:
       browser-test:
         aliases: [api]

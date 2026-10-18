@@ -21,6 +21,11 @@ func (a *App) createOrganization(w http.ResponseWriter, r *http.Request, user pr
 	var input struct {
 		Name     string `json:"name"`
 		Timezone string `json:"timezone"`
+		Admin    *struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		} `json:"admin"`
+		KeyCount int `json:"key_count"`
 	}
 	if err := decode(w, r, &input); err != nil {
 		return err
@@ -32,8 +37,23 @@ func (a *App) createOrganization(w http.ResponseWriter, r *http.Request, user pr
 	if _, err := time.LoadLocation(input.Timezone); err != nil || input.Timezone == "" {
 		return invalid("valid IANA timezone required")
 	}
+	if input.KeyCount < 0 || input.KeyCount > 100 {
+		return invalid("key_count must be between 0 and 100")
+	}
+	// Validate and hash before the transaction so a slow bcrypt does not hold database locks.
+	var email, hash string
+	if input.Admin != nil {
+		email = strings.ToLower(strings.TrimSpace(input.Admin.Email))
+		if !validEmail(email) {
+			return invalid("valid administrator email required")
+		}
+		var err error
+		if hash, err = passwordHash(input.Admin.Password); err != nil {
+			return err
+		}
+	}
 	id := RandomToken()
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}
@@ -44,27 +64,59 @@ func (a *App) createOrganization(w http.ResponseWriter, r *http.Request, user pr
 	if err = audit(r.Context(), tx, id, user.ID, "organization_created", id); err != nil {
 		return err
 	}
+	result := map[string]any{"id": id}
+	if input.Admin != nil {
+		admin := RandomToken()
+		// A duplicate email rolls back the whole tenant, so no organization is left without its administrator.
+		if _, err = tx.Exec(r.Context(), "INSERT INTO accounts(id,email,password_hash,role,organization_id) VALUES($1,$2,$3,'org_admin',$4)", admin, email, hash, id); err != nil {
+			return conflict(err)
+		}
+		if err = audit(r.Context(), tx, id, user.ID, "administrator_created", admin); err != nil {
+			return err
+		}
+		result["admin_id"] = admin
+	}
+	if input.KeyCount > 0 {
+		keys, keyErr := issueKeysTx(r, tx, id, user.ID, input.KeyCount)
+		if keyErr != nil {
+			return keyErr
+		}
+		result["keys"] = keys
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		return err
 	}
-	return send(w, 201, map[string]any{"id": id})
+	return send(w, 201, result)
 }
 func (a *App) listOrganizations(w http.ResponseWriter, r *http.Request, user principal) error {
-	rows, err := a.db.Query(r.Context(), "SELECT id,name,timezone,created_at FROM organizations ORDER BY created_at DESC LIMIT 100")
-	if err != nil {
-		return err
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(search) > 120 {
+		return invalid("search must be at most 120 bytes")
 	}
-	defer rows.Close()
+	// Counts are provisioning metadata only; no activity data reaches the Product Owner.
 	items := []any{}
-	for rows.Next() {
-		var id, name, zone string
-		var created time.Time
-		if err = rows.Scan(&id, &name, &zone, &created); err != nil {
+	err := inScope(r.Context(), a.db, user.scope(), func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `SELECT o.id,o.name,o.timezone,o.created_at,
+ (SELECT count(*) FROM accounts a WHERE a.organization_id=o.id AND a.role='org_admin'),
+ (SELECT count(*) FROM devices d WHERE d.organization_id=o.id AND d.revoked_at IS NULL),
+ (SELECT count(*) FROM enrollment_keys k WHERE k.organization_id=o.id AND k.used_at IS NULL AND k.revoked_at IS NULL AND k.expires_at>now())
+FROM organizations o WHERE $1='' OR position(lower($1) in lower(o.name))>0 ORDER BY o.created_at DESC LIMIT 100`, search)
+		if err != nil {
 			return err
 		}
-		items = append(items, map[string]any{"id": id, "name": name, "timezone": zone, "created_at": created})
-	}
-	if err = rows.Err(); err != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id, name, zone string
+			var created time.Time
+			var admins, devices, keys int64
+			if err = rows.Scan(&id, &name, &zone, &created, &admins, &devices, &keys); err != nil {
+				return err
+			}
+			items = append(items, map[string]any{"id": id, "name": name, "timezone": zone, "created_at": created, "admin_count": admins, "active_device_count": devices, "unused_key_count": keys})
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return err
 	}
 	return send(w, 200, map[string]any{"organizations": items})
@@ -85,7 +137,7 @@ func (a *App) createAdmin(w http.ResponseWriter, r *http.Request, user principal
 	if err != nil {
 		return err
 	}
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}
@@ -116,7 +168,7 @@ func (a *App) issueKeys(w http.ResponseWriter, r *http.Request, user principal) 
 	if input.Count < 1 || input.Count > 100 {
 		return invalid("count must be between 1 and 100")
 	}
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}
@@ -125,59 +177,71 @@ func (a *App) issueKeys(w http.ResponseWriter, r *http.Request, user principal) 
 	if err = tx.QueryRow(r.Context(), "SELECT id FROM organizations WHERE id=$1", r.PathValue("id")).Scan(&org); err != nil {
 		return err
 	}
-	items := []any{}
-	for range input.Count {
-		id, secret := RandomToken(), RandomToken()
-		var expires time.Time
-		if err = tx.QueryRow(r.Context(), "INSERT INTO enrollment_keys(id,organization_id,secret_hash,issuer_id,expires_at) VALUES($1,$2,$3,$4,now()+interval '24 hours') RETURNING expires_at", id, org, digest(secret), user.ID).Scan(&expires); err != nil {
-			return err
-		}
-		if err = audit(r.Context(), tx, org, user.ID, "enrollment_key_issued", id); err != nil {
-			return err
-		}
-		items = append(items, map[string]any{"id": id, "secret": secret, "expires_at": expires})
+	items, err := issueKeysTx(r, tx, org, user.ID, input.Count)
+	if err != nil {
+		return err
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		return err
 	}
 	return send(w, 201, map[string]any{"keys": items})
 }
-func (a *App) keyMetadata(w http.ResponseWriter, r *http.Request, org string) error {
-	var exists bool
-	if err := a.db.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM organizations WHERE id=$1)", org).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return missing()
-	}
-	rows, err := a.db.Query(r.Context(), "SELECT id,created_at,expires_at,device_id,CASE WHEN used_at IS NOT NULL THEN 'used' WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at<=now() THEN 'expired' ELSE 'unused' END FROM enrollment_keys WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 500", org)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
+
+// issueKeysTx stores only key hashes; each secret is returned once to the caller.
+func issueKeysTx(r *http.Request, tx pgx.Tx, org, issuer string, count int) ([]any, error) {
 	items := []any{}
-	for rows.Next() {
-		var id, status string
-		var device *string
-		var created, expires time.Time
-		if err = rows.Scan(&id, &created, &expires, &device, &status); err != nil {
+	for range count {
+		id, secret := RandomToken(), RandomToken()
+		var expires time.Time
+		if err := tx.QueryRow(r.Context(), "INSERT INTO enrollment_keys(id,organization_id,secret_hash,issuer_id,expires_at) VALUES($1,$2,$3,$4,now()+interval '24 hours') RETURNING expires_at", id, org, digest(secret), issuer).Scan(&expires); err != nil {
+			return nil, err
+		}
+		if err := audit(r.Context(), tx, org, issuer, "enrollment_key_issued", id); err != nil {
+			return nil, err
+		}
+		items = append(items, map[string]any{"id": id, "secret": secret, "expires_at": expires})
+	}
+	return items, nil
+}
+func (a *App) keyMetadata(w http.ResponseWriter, r *http.Request, user principal, org string) error {
+	items := []any{}
+	err := inScope(r.Context(), a.db, user.scope(), func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM organizations WHERE id=$1)", org).Scan(&exists); err != nil {
 			return err
 		}
-		items = append(items, map[string]any{"id": id, "organization_id": org, "created_at": created, "expires_at": expires, "device_id": device, "status": status})
-	}
-	if err = rows.Err(); err != nil {
+		if !exists {
+			return missing()
+		}
+		rows, err := tx.Query(r.Context(), "SELECT id,created_at,expires_at,device_id,CASE WHEN used_at IS NOT NULL THEN 'used' WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at<=now() THEN 'expired' ELSE 'unused' END FROM enrollment_keys WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 500", org)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, status string
+			var device *string
+			var created, expires time.Time
+			if err = rows.Scan(&id, &created, &expires, &device, &status); err != nil {
+				return err
+			}
+			items = append(items, map[string]any{"id": id, "organization_id": org, "created_at": created, "expires_at": expires, "device_id": device, "status": status})
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return err
 	}
 	return send(w, 200, map[string]any{"keys": items})
 }
 func (a *App) ownerKeys(w http.ResponseWriter, r *http.Request, user principal) error {
-	return a.keyMetadata(w, r, r.PathValue("id"))
+	return a.keyMetadata(w, r, user, r.PathValue("id"))
 }
 func (a *App) orgKeys(w http.ResponseWriter, r *http.Request, user principal) error {
-	return a.keyMetadata(w, r, user.OrganizationID)
+	return a.keyMetadata(w, r, user, user.OrganizationID)
 }
 func (a *App) revokeKey(w http.ResponseWriter, r *http.Request, user principal) error {
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}
@@ -221,11 +285,16 @@ func (a *App) enroll(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer tx.Rollback(r.Context())
 	var keyID, org string
-	err = tx.QueryRow(r.Context(), "SELECT id,organization_id FROM enrollment_keys WHERE secret_hash=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>now() FOR UPDATE", digest(input.Key)).Scan(&keyID, &org)
+	// The key hash identifies the tenant: claim_enrollment_key locks only the matching unused key,
+	// and every later statement runs under that organization's scope.
+	err = tx.QueryRow(r.Context(), "SELECT key_id,organization_id FROM claim_enrollment_key($1)", digest(input.Key)).Scan(&keyID, &org)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &apiError{401, "invalid or unavailable enrollment key"}
 	}
 	if err != nil {
+		return err
+	}
+	if err = setScope(r.Context(), tx, tenantScope(org)); err != nil {
 		return err
 	}
 	id, token := RandomToken(), RandomToken()
