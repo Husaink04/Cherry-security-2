@@ -13,7 +13,7 @@ Stack: Go backend and agent, React/TypeScript console, PostgreSQL. Kali in VMwar
 5. [M1 Windows operations](docs/M1-WINDOWS-OPERATIONS.md) — native agent security boundary, build, install, enrollment, status, removal, and gated verification.
 6. [M1 verification results](docs/testing/m1-results.md) — passed source checks, unsigned artifact status, and pending deployment/endpoint gates.
 
-Current stage: M0 remains deployed in Kali with schema version 2 and an interactively created Product Owner. M1 source development is on branch `m1`; no native agent is installed and no M1 database migration or TLS listener has been applied. Kali SSH remains stopped by owner choice. Preserve unrelated Kali containers and all database volumes.
+Current stage: Kali runs the M1 server build from `main` with database schema version 4: the native-agent contract (migration 003), PostgreSQL row-level security (migration 004), login rate limits, the organization Overview and audit log, and one-step tenant creation. The agent TLS ingress, certificates and firewall changes (the rest of Batch B) are not deployed, and no native agent is installed. Kali SSH is started manually when needed and is not enabled at boot. Preserve unrelated Kali containers and all database volumes, and deploy only committed code whose schema version matches the migrations you intend to run.
 
 ## Development commands
 

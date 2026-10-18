@@ -31,7 +31,7 @@ See [PRD v0.3](PRD.md) and [M0 plan](superpowers/plans/2026-10-16-m0.md).
 | Observed root filesystem | 75 GB total, approximately 34 GB available at initial check |
 | Docker Engine | `28.5.2+dfsg4` |
 | Docker Compose | `2.40.3-3` |
-| SSH service | Stopped by owner choice; startup enablement is **disabled** |
+| SSH service | Started manually by the owner when needed (`sudo systemctl start ssh`); startup enablement is **disabled** |
 | Docker permissions | `husain` belongs to `docker`; daemon access verified from a fresh SSH connection |
 
 IP addresses, free resources, versions, usernames, and paths are specific to this development environment. Recheck them on a new machine or after VM/network changes. The VM has existing running containers unrelated to CherrySecurity; no existing containers or data have been changed by this setup.
@@ -52,6 +52,7 @@ IP addresses, free resources, versions, usernames, and paths are specific to thi
 12. The original bridged connection later timed out in both directions although SSH was listening. The owner explicitly approved and applied VMware NAT (VMnet8). Verified the same SSH host identity at `192.168.193.129`; no certificate or host-key verification was bypassed.
 13. Deployed the dedicated Compose stack, applied two migrations, completed automated acceptance and restore tests, and bootstrapped the actual Product Owner through the guest terminal. Passwords were entered locally and were not stored in source.
 14. During M1 source work, the owner explicitly chose to keep Kali SSH stopped. Windows source checks use the approved project-local Go toolchain; no M1 deployment has been synchronized to Kali.
+15. On 2026-10-18 the owner started SSH and approved deploying `main` (`14a0145`). The database was backed up (`backups/cherrysecurity-20261018T123437Z-*.dump`, checked with `pg_restore --list`) and the previous images were tagged `:m0-rollback`. A `git archive` of `main` was synced, which excludes uncommitted work. `migrate`, `api` and `web` were rebuilt, and migrations 003 and 004 were applied in one transaction. Verified results: schema 4, seven tables with forced row-level security, a no-login `cherry_auth` role, a restricted `cherryapp` that sees no rows without a tenant scope, readiness 200, and a console sign-in the owner confirmed.
 
 ## 4. SSH identity and connection
 
@@ -142,6 +143,8 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 - The initial Product Owner exists. Sign in using the email and password entered during bootstrap. Bootstrap refuses to overwrite an existing owner. Customer users and device credentials remain separate from Kali SSH accounts.
 - Database data persists in a project-owned volume; private environment credentials remain in the guest's ignored mode-600 `.env`. Never remove the volume or publish this file.
 - Assess available memory during builds because this VM also runs unrelated containers. Do not resize the VM or shut down other workloads automatically.
+- After a VM reboot the API may restart once while PostgreSQL starts; that is expected. nginx looks up the API again within 10 seconds, so the console recovers without a manual restart.
+- Rollback point for the 2026-10-18 deployment: the backup above plus the `cherrysecurity-m0-{api,migrate,web}:m0-rollback` images. Restoring over the live database is a manual, separately approved step; `scripts/restore.sh` restores only into a new test database.
 
 ## 8. Current status and next action
 
@@ -152,7 +155,8 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 | VMware discovery and host-to-guest reachability | Verified |
 | SSH host verification and key authorization | Verified |
 | Docker/Compose installation and daemon access | Verified |
-| Backend / React / PostgreSQL deployment | Running, schema version 2 |
+| Backend / React / PostgreSQL deployment | Running `main`, schema version 4 with row-level security |
+| Agent TLS ingress (rest of Batch B) | Not deployed; certificate, listener, NAT binding and firewall approval still required |
 | M0 acceptance tests / backup restore | Passed; see linked verification report |
 | Actual Product Owner | Created interactively; database count verified |
 | M1 Windows agent source | Service/helper/control source and unsigned local artifacts built on branch `m1`; see M1 results |
