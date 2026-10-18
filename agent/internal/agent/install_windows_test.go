@@ -3,10 +3,38 @@ package agent
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
+
+func TestRunToolReportsBoundedToolOutput(t *testing.T) {
+	system, err := windows.GetSystemDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell := filepath.Join(system, "cmd.exe")
+	if err = runTool(exec.Command(shell, "/c", "exit /b 0")); err != nil {
+		t.Fatalf("successful tool reported %v", err)
+	}
+	// The installer must surface why schtasks or PowerShell failed, not only "exit status 1".
+	err = runTool(exec.Command(shell, "/c", "echo ERROR: task XML is malformed& exit /b 1"))
+	if err == nil || !strings.Contains(err.Error(), "cmd.exe failed") || !strings.Contains(err.Error(), "task XML is malformed") {
+		t.Fatalf("tool output missing from error: %v", err)
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("exit status not preserved: %v", err)
+	}
+	long := strings.Repeat("x", 600)
+	err = runTool(exec.Command(shell, "/c", "echo "+long+"& exit /b 2"))
+	if err == nil || strings.Contains(err.Error(), long) || !strings.Contains(err.Error(), strings.Repeat("x", 512)) {
+		t.Fatalf("tool output was not bounded to 512 bytes: %d bytes", len(err.Error()))
+	}
+}
 
 func TestInstallPlanRejectsExistingResources(t *testing.T) {
 	root := t.TempDir()

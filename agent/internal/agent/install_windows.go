@@ -302,6 +302,20 @@ func taskExecutable() (string, error) {
 	return filepath.Join(directory, "schtasks.exe"), nil
 }
 
+// runTool runs a fixed Windows tool and includes its bounded output in any error, so install failures are diagnosable.
+func runTool(command *exec.Cmd) error {
+	command.Stdin = nil
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	text := strings.TrimSpace(string(output))
+	if len(text) > 512 {
+		text = text[:512]
+	}
+	return fmt.Errorf("%s failed: %w: %s", filepath.Base(command.Path), err, text)
+}
+
 func helperTaskSecurityDescriptor(userSID string) string {
 	return "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;" + userSID + ")"
 }
@@ -312,11 +326,10 @@ func protectHelperTask(ctx context.Context, plan InstallPlan) error {
 		return err
 	}
 	powerShell := filepath.Join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe")
-	script := `$service = New-Object -ComObject 'Schedule.Service'; $service.Connect(); $task = $service.GetFolder('\').GetTask($env:CHERRY_TASK_NAME); $task.SetSecurityDescriptor($env:CHERRY_TASK_SDDL, 0)`
+	script := `$ErrorActionPreference = 'Stop'; $service = New-Object -ComObject 'Schedule.Service'; $service.Connect(); $task = $service.GetFolder('\').GetTask($env:CHERRY_TASK_NAME); $task.SetSecurityDescriptor($env:CHERRY_TASK_SDDL, 0)`
 	command := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", script)
-	command.Stdin = nil
 	command.Env = append(os.Environ(), "CHERRY_TASK_NAME="+plan.TaskName, "CHERRY_TASK_SDDL="+helperTaskSecurityDescriptor(plan.UserSID))
-	return command.Run()
+	return runTool(command)
 }
 
 func helperTaskXML(plan InstallPlan) ([]byte, error) {
@@ -399,8 +412,7 @@ func createHelperTask(ctx context.Context, plan InstallPlan) error {
 		return err
 	}
 	command := exec.CommandContext(ctx, executable, "/Create", "/TN", plan.TaskName, "/XML", temporaryPath)
-	command.Stdin = nil
-	if err = command.Run(); err != nil {
+	if err = runTool(command); err != nil {
 		return err
 	}
 	if err = protectHelperTask(ctx, plan); err != nil {
@@ -416,8 +428,7 @@ func deleteHelperTask(ctx context.Context, taskName string) error {
 		return err
 	}
 	command := exec.CommandContext(ctx, executable, "/Delete", "/TN", taskName, "/F")
-	command.Stdin = nil
-	return command.Run()
+	return runTool(command)
 }
 
 func runHelperTask(ctx context.Context, taskName string) error {
@@ -426,8 +437,7 @@ func runHelperTask(ctx context.Context, taskName string) error {
 		return err
 	}
 	command := exec.CommandContext(ctx, executable, "/Run", "/TN", taskName)
-	command.Stdin = nil
-	return command.Run()
+	return runTool(command)
 }
 
 func stopHelperTask(ctx context.Context, taskName string) {
