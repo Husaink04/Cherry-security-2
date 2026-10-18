@@ -32,19 +32,21 @@ def prepare(address: str, directory: Path) -> None:
     directory.mkdir(mode=0o700)
     ca_key, ca_cert = directory / "ca.key", directory / "ca.crt"
     server_key, server_cert = directory / "server.key", directory / "server.crt"
-    run("genpkey", "-algorithm", "Ed25519", "-out", str(ca_key))
+    # ECDSA P-256 works with Go and with Windows Schannel (curl.exe, browsers); Ed25519 does not.
+    ec_key = ("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-pkeyopt", "ec_param_enc:named_curve")
+    run(*ec_key, "-out", str(ca_key))
     run("req", "-new", "-x509", "-key", str(ca_key), "-out", str(ca_cert),
-        "-days", "365", "-subj", "/CN=CherrySecurity Local Agent CA",
+        "-sha256", "-days", "365", "-subj", "/CN=CherrySecurity Local Agent CA",
         "-addext", "basicConstraints=critical,CA:TRUE",
         "-addext", "keyUsage=critical,keyCertSign,cRLSign")
-    run("genpkey", "-algorithm", "Ed25519", "-out", str(server_key))
-    request = run("req", "-new", "-key", str(server_key),
+    run(*ec_key, "-out", str(server_key))
+    request = run("req", "-new", "-sha256", "-key", str(server_key),
                   "-subj", "/CN=CherrySecurity Agent Ingress",
                   "-addext", f"subjectAltName=IP:{ip}",
                   "-addext", "basicConstraints=critical,CA:FALSE",
                   "-addext", "keyUsage=critical,digitalSignature",
                   "-addext", "extendedKeyUsage=serverAuth")
-    run("x509", "-req", "-in", "/dev/stdin", "-CA", str(ca_cert),
+    run("x509", "-req", "-sha256", "-in", "/dev/stdin", "-CA", str(ca_cert),
         "-CAkey", str(ca_key), "-set_serial", str(secrets.randbits(128)),
         "-days", "30", "-copy_extensions", "copy", "-out", str(server_cert),
         input_bytes=request)
