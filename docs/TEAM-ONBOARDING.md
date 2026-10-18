@@ -1,6 +1,6 @@
 # CherrySecurity — Team onboarding and setup runbook
 
-Last verified: 2026-10-16. M0 is deployed and verified. Read the PRD for requirements and the verification report for acceptance evidence.
+Last verified: 2026-10-18. M0 is deployed and verified; M1 source is under development and is not installed. Read the PRD and milestone verification reports before changing either environment.
 
 ## 1. Project and current milestone
 
@@ -31,7 +31,7 @@ See [PRD v0.3](PRD.md) and [M0 plan](superpowers/plans/2026-10-16-m0.md).
 | Observed root filesystem | 75 GB total, approximately 34 GB available at initial check |
 | Docker Engine | `28.5.2+dfsg4` |
 | Docker Compose | `2.40.3-3` |
-| SSH service | Active; startup enablement is **disabled** |
+| SSH service | Stopped by owner choice; startup enablement is **disabled** |
 | Docker permissions | `husain` belongs to `docker`; daemon access verified from a fresh SSH connection |
 
 IP addresses, free resources, versions, usernames, and paths are specific to this development environment. Recheck them on a new machine or after VM/network changes. The VM has existing running containers unrelated to CherrySecurity; no existing containers or data have been changed by this setup.
@@ -48,9 +48,10 @@ IP addresses, free resources, versions, usernames, and paths are specific to thi
 8. Generated a dedicated Windows SSH key and the owner appended its **public** half to the guest user's `~/.ssh/authorized_keys`. The private half remains on Windows.
 9. Verified passwordless SSH as `husain`. Inspected OS, memory, disk, and Docker access using read-only commands.
 10. Docker daemon access initially failed with a socket permission error. The owner ran `sudo usermod -aG docker husain`. A fresh SSH connection confirmed group membership and successful Docker daemon access.
-11. Found existing guest containers and recorded that they must be preserved. SSH is currently running but is not enabled to start automatically at boot.
+11. Found existing guest containers and recorded that they must be preserved. SSH was not enabled to start automatically at boot.
 12. The original bridged connection later timed out in both directions although SSH was listening. The owner explicitly approved and applied VMware NAT (VMnet8). Verified the same SSH host identity at `192.168.193.129`; no certificate or host-key verification was bypassed.
 13. Deployed the dedicated Compose stack, applied two migrations, completed automated acceptance and restore tests, and bootstrapped the actual Product Owner through the guest terminal. Passwords were entered locally and were not stored in source.
+14. During M1 source work, the owner explicitly chose to keep Kali SSH stopped. Windows source checks use the approved project-local Go toolchain; no M1 deployment has been synchronized to Kali.
 
 ## 4. SSH identity and connection
 
@@ -154,9 +155,10 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 | Backend / React / PostgreSQL deployment | Running, schema version 2 |
 | M0 acceptance tests / backup restore | Passed; see linked verification report |
 | Actual Product Owner | Created interactively; database count verified |
-| Real Windows monitoring agent | Later milestone |
+| M1 Windows agent source | Service/helper/control source and unsigned local artifacts built on branch `m1`; see M1 results |
+| Real Windows monitoring agent | Not installed; Batch C approval is still required |
 
-Use the [operations guide](M0-DEVELOPMENT.md) for repeatable commands and the [M0 results](testing/m0-results.md) for verified behavior and limits. M1 requires a separately approved Windows-agent implementation scope.
+Use the [M0 operations guide](M0-DEVELOPMENT.md), [M0 results](testing/m0-results.md), [M1 Windows operations guide](M1-WINDOWS-OPERATIONS.md), and [M1 results](testing/m1-results.md). M1 deployment and endpoint acceptance remain separately approved batches.
 
 ## 9. Documentation maintenance
 

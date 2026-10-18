@@ -10,7 +10,7 @@ Updated 2026-10-16. Full setup history, connection commands, teammate access, an
 - VMware's guest-IP lookup failed; this does not establish that the network is broken.
 - Windows-to-Kali SSH key access is verified as `husain@192.168.193.129`, with the guest host fingerprint verified against its console.
 - Guest OS is Kali Rolling 2026.3, x86_64. Docker Engine 28.5.2+dfsg4 and Compose 2.40.3-3 are installed; daemon access works as `husain` after approved Docker-group membership.
-- SSH is active but disabled at boot. Existing unrelated containers are running and must be preserved.
+- SSH is stopped by owner choice and disabled at boot. Existing unrelated containers are running and must be preserved.
 
 ## Initial access procedure (completed; reference for repeat setup)
 
@@ -25,7 +25,7 @@ Updated 2026-10-16. Full setup history, connection commands, teammate access, an
    docker compose version
    ```
 
-3. If SSH is installed but inactive, start it in Kali:
+3. SSH is intentionally stopped. Start it in Kali only after the owner explicitly approves restarting it:
 
    ```sh
    sudo systemctl start ssh
@@ -47,4 +47,4 @@ Updated 2026-10-16. Full setup history, connection commands, teammate access, an
 
 ## Current deployment
 
-SSH and Docker access are verified. The dedicated stack is deployed at `/home/husain/cherrysecurity-m0`, schema version 2. The real Product Owner was created interactively. Automated backend, browser, fresh-install, and backup/restore checks passed; see [M0 results](testing/m0-results.md). Existing unrelated workloads were preserved. Native Windows monitoring remains M1.
+SSH and Docker access were verified before SSH was stopped by owner choice. The dedicated stack remains deployed at `/home/husain/cherrysecurity-m0`, schema version 2. The real Product Owner was created interactively. Automated backend, browser, fresh-install, and backup/restore checks passed; see [M0 results](testing/m0-results.md). Existing unrelated workloads were preserved. M1 source exists only on Windows and has not been synchronized or deployed.

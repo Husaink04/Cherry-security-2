@@ -11,6 +11,7 @@ Stack: Go backend and agent, React/TypeScript console, PostgreSQL. Kali in VMwar
 3. [M0 verification results](docs/testing/m0-results.md) — acceptance evidence, review corrections, and limitations.
 4. [Kali access checklist](docs/KALI-SETUP.md) — short access and troubleshooting reference.
 5. [M1 Windows operations](docs/M1-WINDOWS-OPERATIONS.md) — native agent security boundary, build, install, enrollment, status, removal, and gated verification.
+6. [M1 verification results](docs/testing/m1-results.md) — passed source checks, unsigned artifact status, and pending deployment/endpoint gates.
 
 Current stage: M0 remains deployed in Kali with schema version 2 and an interactively created Product Owner. M1 source development is on branch `m1`; no native agent is installed and no M1 database migration or TLS listener has been applied. Kali SSH remains stopped by owner choice. Preserve unrelated Kali containers and all database volumes.
 
