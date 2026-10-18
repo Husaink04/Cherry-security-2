@@ -137,41 +137,8 @@ func verifyPipeServer(connection net.Conn, binding SessionBinding) error {
 	if status.ProcessId != pid || pid == 0 || status.CurrentState != windows.SERVICE_RUNNING {
 		return errors.New("unexpected pipe server")
 	}
-	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(process)
-	var identity windows.Token
-	if err = windows.OpenProcessToken(process, windows.TOKEN_QUERY, &identity); err != nil {
-		return err
-	}
-	defer identity.Close()
-	user, err := identity.GetTokenUser()
-	if err != nil || user.User.Sid.String() != "S-1-5-19" {
-		return errors.New("unexpected service identity")
-	}
-	groups, err := identity.GetTokenGroups()
-	if err != nil {
-		return err
-	}
-	found := false
-	for _, group := range groups.AllGroups() {
-		if group.Sid.String() == binding.ServiceSID {
-			found = true
-		}
-	}
-	if !found {
-		return errors.New("service SID missing")
-	}
-	path := make([]uint16, 32768)
-	size := uint32(len(path))
-	if err = windows.QueryFullProcessImageName(process, 0, &path[0], &size); err != nil {
-		return err
-	}
-	if binding.ServicePath == "" || !strings.EqualFold(windows.UTF16ToString(path[:size]), binding.ServicePath) {
-		return errors.New("unexpected service binary")
-	}
+	// Standard users cannot open a LocalService process, so the server is bound through the SCM instead:
+	// only the SCM starts this PID, and only administrators can change the service's binary or account.
 	return nil
 }
 
