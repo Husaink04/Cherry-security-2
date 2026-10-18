@@ -73,3 +73,34 @@ func TestEngineStoresServiceObservationAndRejectsInvalidState(t *testing.T) {
 		t.Fatal("expired policy accepted service collection")
 	}
 }
+
+func TestHelperDeathDoesNotFabricateActivity(t *testing.T) {
+	queue, err := OpenQueue(filepath.Join(t.TempDir(), "helper-loss.db"), QueueLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	policy := testPolicy()
+	engine, err := NewEngine(queue, policy, policy.ServerTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := token()
+	first := HelperMessage{Version: 1, Nonce: token(), MessageID: token(), HelperInstance: instance, Sequence: 1, Kind: "samples", Samples: []Sample{{At: policy.ServerTime, State: "active", App: "editor.exe", Session: "console", Monotonic: 0}}}
+	if err = engine.ObserveMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.MarkHelperMissing(policy.ServerTime.Add(2*time.Second), 2*time.Second, "console"); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.MarkHelperMissing(policy.ServerTime.Add(3*time.Second), 3*time.Second, "console"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := queue.Batch(MaxBatchEvents, MaxBatchBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Kind != "application" || events[0].Payload.End.After(policy.ServerTime.Add(2*time.Second)) || events[1].Kind != "gap" || events[1].Payload.GapReason != "helper_missing" || events[1].Payload.App != "" || !events[1].Payload.Start.Equal(policy.ServerTime.Add(2*time.Second)) {
+		t.Fatalf("helper loss attribution: %+v", events)
+	}
+}

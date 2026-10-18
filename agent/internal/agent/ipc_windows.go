@@ -100,7 +100,7 @@ func verifyClientToken(identity windows.Token, binding SessionBinding) error {
 	if err != nil {
 		return err
 	}
-	if user.User.Sid.String() != binding.UserSID || session != binding.SessionID || session != windows.WTSGetActiveConsoleSessionId() || !strings.HasPrefix(logon, "S-1-5-5-") || (binding.LogonSID != "" && logon != binding.LogonSID) {
+	if user.User.Sid.String() != binding.UserSID || (binding.SessionID != ^uint32(0) && session != binding.SessionID) || session != windows.WTSGetActiveConsoleSessionId() || !strings.HasPrefix(logon, "S-1-5-5-") || (binding.LogonSID != "" && logon != binding.LogonSID) {
 		return errors.New("helper identity rejected")
 	}
 	return nil
@@ -188,6 +188,10 @@ func ConnectHelperPipe(ctx context.Context, binding SessionBinding) (net.Conn, e
 }
 
 func ListenHelperPipe(ctx context.Context, binding SessionBinding, handler func(HelperMessage) (HelperReply, error)) error {
+	return listenHelperPipe(ctx, binding, handler, nil)
+}
+
+func listenHelperPipe(ctx context.Context, binding SessionBinding, handler func(HelperMessage) (HelperReply, error), disconnected func()) error {
 	descriptor, err := helperPipeACL(binding)
 	if err != nil {
 		return err
@@ -215,11 +219,14 @@ func ListenHelperPipe(ctx context.Context, binding SessionBinding, handler func(
 			return err
 		}
 		// One selected session: serialize connections and bound each idle read.
-		serveHelperConnection(connection, binding, handler)
+		connected := serveHelperConnection(connection, binding, handler)
 		connection.Close()
+		if connected && disconnected != nil {
+			disconnected()
+		}
 	}
 }
-func serveHelperConnection(connection net.Conn, binding SessionBinding, handler func(HelperMessage) (HelperReply, error)) {
+func serveHelperConnection(connection net.Conn, binding SessionBinding, handler func(HelperMessage) (HelperReply, error)) bool {
 	nonce := token()
 	var previous uint64
 	var previousBytes string
@@ -227,42 +234,49 @@ func serveHelperConnection(connection net.Conn, binding SessionBinding, handler 
 	connection.SetDeadline(time.Now().Add(10 * time.Second))
 	var hello HelperMessage
 	if ReadFrame(connection, &hello) != nil || hello.Version != 1 || hello.Kind != "hello" || hello.EnrollmentKey != "" || hello.MessageID != "" || hello.HelperInstance != "" || len(hello.Samples) != 0 {
-		return
+		return false
 	}
 	if inspectPipeClient(connection, func(identity windows.Token) error { return verifyClientToken(identity, binding) }) != nil {
-		return
+		return false
 	}
-	if WriteFrame(connection, HelperReply{Version: 1, Nonce: nonce, State: "connected"}) != nil {
-		return
+	reply, err := handler(hello)
+	if err != nil {
+		return false
+	}
+	reply.Version = 1
+	reply.Nonce = nonce
+	reply.State = "connected"
+	if WriteFrame(connection, reply) != nil {
+		return true
 	}
 	for {
 		connection.SetDeadline(time.Now().Add(10 * time.Second))
 		var message HelperMessage
 		if ReadFrame(connection, &message) != nil {
-			return
+			return true
 		}
 		if message.Version != 1 || message.Nonce != nonce || message.Sequence == 0 || !validToken(message.MessageID) || !validToken(message.HelperInstance) || message.EnrollmentKey != "" || len(message.Samples) > 5 || (message.Kind != "samples" && message.Kind != "status") || (message.Kind == "samples" && len(message.Samples) == 0) || (message.Kind == "status" && len(message.Samples) != 0) {
-			return
+			return true
 		}
 		encoded, err := frameDigest(message)
 		if err != nil {
-			return
+			return true
 		}
 		if message.Sequence == previous {
 			if encoded != previousBytes {
-				return
+				return true
 			}
 			if WriteFrame(connection, previousReply) != nil {
-				return
+				return true
 			}
 			continue
 		}
 		if previous != 0 && message.Sequence != previous+1 {
-			return
+			return true
 		}
 		reply, err := handler(message)
 		if err != nil {
-			return
+			return true
 		}
 		reply.Version = 1
 		reply.Nonce = nonce
@@ -271,7 +285,7 @@ func serveHelperConnection(connection net.Conn, binding SessionBinding, handler 
 		previousBytes = encoded
 		previousReply = reply
 		if WriteFrame(connection, reply) != nil {
-			return
+			return true
 		}
 	}
 }
@@ -315,7 +329,7 @@ func ServeEnrollment(ctx context.Context, enroll func(context.Context, []byte) e
 				return nil
 			})
 		}
-		if readErr == nil && message.Version == 1 && message.Kind == "enroll" && len(message.EnrollmentKey) == 64 {
+		if readErr == nil && message.Version == 1 && message.Kind == "enroll" && validToken(message.EnrollmentKey) {
 			key := []byte(message.EnrollmentKey)
 			readErr = enroll(ctx, key)
 			clear(key)
@@ -331,4 +345,32 @@ func ServeEnrollment(ctx context.Context, enroll func(context.Context, []byte) e
 		_ = WriteFrame(connection, reply)
 		connection.Close()
 	}
+}
+
+func RequestEnrollment(ctx context.Context, binding SessionBinding, enrollmentKey []byte) error {
+	if !validToken(string(enrollmentKey)) {
+		return errors.New("invalid enrollment key")
+	}
+	connection, err := winio.DialPipeAccessImpLevel(ctx, enrollmentPipe, uint32(pipeClientRights), winio.PipeImpLevelIdentification)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if err = verifyPipeServer(connection, binding); err != nil {
+		return err
+	}
+	connection.SetDeadline(time.Now().Add(10 * time.Second))
+	message := HelperMessage{Version: 1, Kind: "enroll", EnrollmentKey: string(enrollmentKey)}
+	if err = WriteFrame(connection, message); err != nil {
+		return err
+	}
+	message.EnrollmentKey = ""
+	var reply HelperReply
+	if err = ReadFrame(connection, &reply); err != nil {
+		return err
+	}
+	if reply.Version != 1 || reply.State != "enrolled" || reply.Error != "" {
+		return errors.New("enrollment rejected")
+	}
+	return nil
 }

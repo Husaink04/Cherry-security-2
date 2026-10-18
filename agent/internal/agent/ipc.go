@@ -25,6 +25,7 @@ type HelperReply struct {
 	Nonce    string  `json:"nonce"`
 	Sequence uint64  `json:"sequence"`
 	Policy   *Policy `json:"policy,omitempty"`
+	Status   *Status `json:"status,omitempty"`
 	State    string  `json:"state"`
 	Error    string  `json:"error,omitempty"`
 }

@@ -153,6 +153,28 @@ func (engine *Engine) ObserveService(observation ServiceObservation) error {
 	return nil
 }
 
+func (engine *Engine) MarkHelperMissing(at time.Time, monotonic time.Duration, session string) error {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if at.IsZero() || monotonic < 0 || session == "" || len(session) > 128 {
+		return errors.New("invalid helper loss boundary")
+	}
+	policy := engine.timeline.checkpoint.Policy
+	if !at.Before(policy.ServerTime.Add(time.Duration(policy.ValidForSeconds) * time.Second)) {
+		return errors.New("policy unavailable or expired")
+	}
+	candidate := &Timeline{checkpoint: engine.timeline.Checkpoint(), restored: engine.timeline.restored}
+	events, err := candidate.Observe(Sample{At: at, Monotonic: monotonic, State: "helper_missing", Session: session})
+	if err != nil {
+		return err
+	}
+	if err = engine.queue.CommitObservation(token(), candidate.Checkpoint(), events); err != nil {
+		return err
+	}
+	engine.timeline = candidate
+	return nil
+}
+
 func (engine *Engine) Deliver(ctx context.Context, client *Client, credential string) error {
 	engine.mu.Lock()
 	watermark := engine.timeline.checkpoint.Policy.IngestNotBefore
