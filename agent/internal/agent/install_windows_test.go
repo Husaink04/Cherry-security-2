@@ -73,6 +73,15 @@ func TestHelperTaskUsesSelectedInteractiveIdentity(t *testing.T) {
 	if strings.Contains(xml, "<Password>") || strings.Contains(xml, "HighestAvailable") {
 		t.Fatal("task requests credentials or elevation")
 	}
+	descriptor := helperTaskSecurityDescriptor(plan.UserSID)
+	for _, required := range []string{"D:P", "(A;;GA;;;SY)", "(A;;GA;;;BA)", "(A;;GRGX;;;" + plan.UserSID + ")"} {
+		if !strings.Contains(descriptor, required) {
+			t.Fatalf("task security descriptor missing %q", required)
+		}
+	}
+	if strings.Contains(descriptor, "GWGX;;;"+plan.UserSID) || strings.Contains(descriptor, "GA;;;"+plan.UserSID) {
+		t.Fatal("selected user can modify the managed task")
+	}
 }
 
 func TestInstallPlanRejectsChangedSourceBeforeMutation(t *testing.T) {

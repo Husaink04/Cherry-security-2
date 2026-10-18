@@ -15,6 +15,29 @@ type Status struct {
 	LastError   string
 }
 
+func validateStatus(status Status) error {
+	if status.QueueEvents < 0 || status.LostEvents < 0 {
+		return errors.New("invalid status counters")
+	}
+	switch status.Helper {
+	case "healthy", "missing":
+	default:
+		return errors.New("invalid helper status")
+	}
+	switch status.Policy {
+	case "current", "cached", "unavailable":
+	default:
+		return errors.New("invalid policy status")
+	}
+	switch status.LastError {
+	case "none", "helper", "inventory", "policy", "network", "credential", "integrity", "storage":
+	default:
+		return errors.New("invalid status error")
+	}
+	_, err := status.Notice()
+	return err
+}
+
 func (status Status) Notice() (string, error) {
 	switch status.State {
 	case "collecting", "idle", "locked", "outside_schedule", "offline", "helper_missing", "policy_unavailable", "revoked", "error", "unsupported_session", "suspended", "logged_out":

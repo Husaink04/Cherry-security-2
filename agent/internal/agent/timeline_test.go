@@ -51,6 +51,25 @@ func TestTimelineIdleScheduleAndRecovery(t *testing.T) {
 	}
 }
 
+func TestSuspendBoundarySurvivesLongResumeGap(t *testing.T) {
+	policy := testPolicy()
+	timeline := NewTimeline(policy)
+	session := "console"
+	if _, err := timeline.Observe(Sample{At: policy.ServerTime, Monotonic: 0, State: "active", App: "editor.exe", Session: session}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := timeline.Observe(Sample{At: policy.ServerTime.Add(time.Second), Monotonic: time.Second, State: "suspended", Session: session}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := timeline.Observe(Sample{At: policy.ServerTime.Add(time.Hour), Monotonic: 2 * time.Second, State: "active", App: "editor.exe", Session: session})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 || events[len(events)-1].Kind != "gap" || events[len(events)-1].Payload.GapReason != "suspended" {
+		t.Fatalf("suspend boundary lost across resume: %+v", events)
+	}
+}
+
 func TestPolicyChangeDoesNotBroadenProvisionalCollection(t *testing.T) {
 	policy := testPolicy()
 	policy.Schedule = Schedule{Days: []int{6}, Start: "09:00", End: "09:01"}

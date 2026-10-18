@@ -302,6 +302,23 @@ func taskExecutable() (string, error) {
 	return filepath.Join(directory, "schtasks.exe"), nil
 }
 
+func helperTaskSecurityDescriptor(userSID string) string {
+	return "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;" + userSID + ")"
+}
+
+func protectHelperTask(ctx context.Context, plan InstallPlan) error {
+	systemDirectory, err := windows.GetSystemDirectory()
+	if err != nil {
+		return err
+	}
+	powerShell := filepath.Join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe")
+	script := `$service = New-Object -ComObject 'Schedule.Service'; $service.Connect(); $task = $service.GetFolder('\').GetTask($env:CHERRY_TASK_NAME); $task.SetSecurityDescriptor($env:CHERRY_TASK_SDDL, 0)`
+	command := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", script)
+	command.Stdin = nil
+	command.Env = append(os.Environ(), "CHERRY_TASK_NAME="+plan.TaskName, "CHERRY_TASK_SDDL="+helperTaskSecurityDescriptor(plan.UserSID))
+	return command.Run()
+}
+
 func helperTaskXML(plan InstallPlan) ([]byte, error) {
 	type logonTrigger struct {
 		Enabled bool   `xml:"Enabled"`
@@ -383,7 +400,14 @@ func createHelperTask(ctx context.Context, plan InstallPlan) error {
 	}
 	command := exec.CommandContext(ctx, executable, "/Create", "/TN", plan.TaskName, "/XML", temporaryPath)
 	command.Stdin = nil
-	return command.Run()
+	if err = command.Run(); err != nil {
+		return err
+	}
+	if err = protectHelperTask(ctx, plan); err != nil {
+		_ = deleteHelperTask(context.Background(), plan.TaskName)
+		return err
+	}
+	return nil
 }
 
 func deleteHelperTask(ctx context.Context, taskName string) error {
@@ -394,6 +418,26 @@ func deleteHelperTask(ctx context.Context, taskName string) error {
 	command := exec.CommandContext(ctx, executable, "/Delete", "/TN", taskName, "/F")
 	command.Stdin = nil
 	return command.Run()
+}
+
+func runHelperTask(ctx context.Context, taskName string) error {
+	executable, err := taskExecutable()
+	if err != nil {
+		return err
+	}
+	command := exec.CommandContext(ctx, executable, "/Run", "/TN", taskName)
+	command.Stdin = nil
+	return command.Run()
+}
+
+func stopHelperTask(ctx context.Context, taskName string) {
+	executable, err := taskExecutable()
+	if err != nil {
+		return
+	}
+	command := exec.CommandContext(ctx, executable, "/End", "/TN", taskName)
+	command.Stdin = nil
+	_ = command.Run()
 }
 
 func helperTaskExists(ctx context.Context, taskName string) (bool, error) {
@@ -440,14 +484,19 @@ func ApplyInstall(ctx context.Context, plan InstallPlan) (resultError error) {
 	createdDirectories := []string{}
 	var service *mgr.Service
 	taskCreated := false
+	serviceStarted := false
 	defer func() {
 		if resultError == nil {
 			return
 		}
 		if taskCreated {
+			stopHelperTask(context.Background(), plan.TaskName)
 			_ = deleteHelperTask(context.Background(), plan.TaskName)
 		}
 		if service != nil {
+			if serviceStarted {
+				_, _ = service.Control(svc.Stop)
+			}
 			_ = service.Delete()
 			service.Close()
 		}
@@ -512,6 +561,9 @@ func ApplyInstall(ctx context.Context, plan InstallPlan) (resultError error) {
 	if err = service.Start(); err != nil {
 		return err
 	}
+	serviceStarted = true
+	// Best effort: the task also starts at the employee's next sign-in, so an absent session must not undo the install.
+	_ = runHelperTask(ctx, plan.TaskName)
 	service.Close()
 	service = nil
 	return nil
@@ -571,6 +623,7 @@ func Uninstall(ctx context.Context, preserveData bool) error {
 		return err
 	}
 	if taskPresent {
+		stopHelperTask(ctx, "CherrySecurity Session Helper")
 		if err = deleteHelperTask(ctx, "CherrySecurity Session Helper"); err != nil {
 			return err
 		}
