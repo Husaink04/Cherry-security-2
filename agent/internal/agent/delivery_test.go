@@ -11,6 +11,13 @@ import (
 )
 
 func TestDeliveryIsolatesOneRejectedEvent(t *testing.T) {
+	// 409 conflicts must be isolated like validation errors instead of blocking the queue.
+	for _, status := range []int{400, 409} {
+		t.Run(http.StatusText(status), func(t *testing.T) { deliverWithOneRejection(t, status) })
+	}
+}
+
+func deliverWithOneRejection(t *testing.T, status int) {
 	queue, err := OpenQueue(filepath.Join(t.TempDir(), "deliver.db"), QueueLimit)
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +38,7 @@ func TestDeliveryIsolatesOneRejectedEvent(t *testing.T) {
 		accepted := []string{}
 		for _, event := range input.Events {
 			if event.ID == events[1].ID {
-				w.WriteHeader(400)
+				w.WriteHeader(status)
 				return
 			}
 			accepted = append(accepted, event.ID)

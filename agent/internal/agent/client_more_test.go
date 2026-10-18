@@ -52,6 +52,9 @@ func TestTransportAcknowledgementAndNetworkFailures(t *testing.T) {
 		if _, err = client.Upload(context.Background(), string(makeToken()), []Event{event}); err == nil || IsCredentialRejected(err) {
 			t.Fatalf("invalid mode %d accepted or misclassified: %v", bad, err)
 		}
+		if (bad == 7) != IsIntegrityRejected(err) {
+			t.Fatalf("integrity rejection classification for mode %d: %v", bad, err)
+		}
 	}
 	mode.Store(5)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)

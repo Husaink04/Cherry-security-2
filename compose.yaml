@@ -56,7 +56,9 @@ services:
     mem_limit: 96m
     logging: {driver: json-file, options: {max-size: 5m, max-file: '2'}}
   agent-ingress:
-    image: nginx:1.29-alpine
+    image: nginxinc/nginx-unprivileged:1.28-alpine
+    # Runs as the key owner so the mode-600 TLS key is readable without extra capabilities.
+    user: '1000:1000'
     profiles: [agent-ingress]
     # The safe loopback default cannot reach Windows; Batch B sets a verified NAT IPv4 address.
     ports: ['${AGENT_BIND_IP:-127.0.0.1}:8443:8443']
