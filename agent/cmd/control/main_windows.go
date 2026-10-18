@@ -43,7 +43,7 @@ func fail(err error) {
 }
 
 func main() {
-	action := flag.String("action", "plan", "plan, install, enroll, or uninstall")
+	action := flag.String("action", "plan", "plan, install, upgrade, enroll, or uninstall")
 	endpoint := flag.String("endpoint", "", "agent HTTPS origin")
 	userSID := flag.String("user-sid", "", "selected employee SID")
 	serviceBinary := flag.String("service", "", "absolute service executable path")
@@ -69,6 +69,17 @@ func main() {
 			}
 			fmt.Println("CherrySecurity Agent installed. Enrollment is still required.")
 		}
+	case "upgrade":
+		plan, err := agent.PlanUpgrade(ctx, agent.UpgradeOptions{ServiceBinary: *serviceBinary, HelperBinary: *helperBinary, ControlBinary: *controlBinary})
+		if err != nil {
+			fail(err)
+		}
+		encoded, _ := json.MarshalIndent(plan, "", "  ")
+		fmt.Println(string(encoded))
+		if err = agent.ApplyUpgrade(ctx, plan); err != nil {
+			fail(err)
+		}
+		fmt.Println("CherrySecurity Agent upgraded. Enrollment and queued data were kept.")
 	case "enroll":
 		config, err := agent.LoadConfig(*configPath)
 		if err != nil {

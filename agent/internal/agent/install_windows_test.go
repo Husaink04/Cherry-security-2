@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -85,6 +87,129 @@ func TestManagedServiceRecoveryAndAdminStop(t *testing.T) {
 		if _, err := descriptorDACL(descriptor); err != nil {
 			t.Fatalf("invalid security descriptor: %v", err)
 		}
+	}
+}
+
+func lockWithoutDeleteSharing(t *testing.T, path string) windows.Handle {
+	t.Helper()
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handle
+}
+
+func TestRemoveWhenReleasedWaitsForAnExitingProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "CherrySecurityHelper.exe")
+	if err := os.WriteFile(path, []byte("synthetic helper"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handle := lockWithoutDeleteSharing(t, path)
+	if err := os.Remove(path); err == nil {
+		t.Fatal("test lock did not block deletion")
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		windows.CloseHandle(handle)
+	}()
+	// Uninstall used to fail here with "Access is denied" while the helper was still exiting.
+	if err := removeWhenReleased(context.Background(), path); err != nil {
+		t.Fatalf("file released after 300 ms was not removed: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("file still present after removal")
+	}
+	if err := removeWhenReleased(context.Background(), path); err != nil {
+		t.Fatalf("missing file must not be an error: %v", err)
+	}
+	held := filepath.Join(t.TempDir(), "held.exe")
+	if err := os.WriteFile(held, []byte("held"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lock := lockWithoutDeleteSharing(t, held)
+	defer windows.CloseHandle(lock)
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if err := removeWhenReleased(ctx, held); err == nil {
+		t.Fatal("a file that stays locked must eventually fail")
+	}
+}
+
+func TestControlRefusesToRunFromInstallFolder(t *testing.T) {
+	install := `C:\Program Files\CherrySecurity`
+	for _, executable := range []string{`C:\Program Files\CherrySecurity\CherrySecurityControl.exe`, `c:\program files\cherrysecurity\CherrySecurityControl.exe`} {
+		if !runningFrom(executable, install) {
+			t.Fatalf("%s not detected as inside the install folder", executable)
+		}
+	}
+	for _, executable := range []string{`D:\Cherry-security\artifacts\agent\batch-c6\CherrySecurityControl-m1.exe`, `C:\Program Files\CherrySecurity-old\CherrySecurityControl.exe`} {
+		if runningFrom(executable, install) {
+			t.Fatalf("%s wrongly treated as inside the install folder", executable)
+		}
+	}
+}
+
+func TestUpgradeSwapKeepsBackupAndRestores(t *testing.T) {
+	root := t.TempDir()
+	files := []UpgradeFile{}
+	for _, name := range []string{"CherrySecurityAgent.exe", "CherrySecurityHelper.exe"} {
+		destination, source := filepath.Join(root, name), filepath.Join(root, "new-"+name)
+		if err := os.WriteFile(destination, []byte("old "+name), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(source, []byte("new "+name), 0600); err != nil {
+			t.Fatal(err)
+		}
+		oldHash, err := sourceHash(destination, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newHash, err := sourceHash(source, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, UpgradeFile{Source: source, Destination: destination, OldSHA256: oldHash, NewSHA256: newHash})
+	}
+	read := func(path string) string {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	swapped, err := replaceWithBackup(context.Background(), files)
+	if err != nil || len(swapped) != 2 {
+		t.Fatalf("swap failed: %v", err)
+	}
+	if read(files[0].Destination) != "new CherrySecurityAgent.exe" || read(files[0].Destination+".old") != "old CherrySecurityAgent.exe" {
+		t.Fatal("swap did not install the new file and keep the old one")
+	}
+	if err = restoreBackups(context.Background(), swapped); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if !strings.HasPrefix(read(file.Destination), "old ") {
+			t.Fatalf("%s not restored", file.Destination)
+		}
+	}
+	// A corrupted staged copy must stop the swap; only files already swapped are reported for restoring.
+	files[1].NewSHA256 = strings.Repeat("0", 64)
+	swapped, err = replaceWithBackup(context.Background(), files)
+	if err == nil || len(swapped) != 1 {
+		t.Fatalf("integrity failure not detected: swapped=%d err=%v", len(swapped), err)
+	}
+	if err = restoreBackups(context.Background(), swapped); err != nil {
+		t.Fatal(err)
+	}
+	if read(files[0].Destination) != "old CherrySecurityAgent.exe" || read(files[1].Destination) != "old CherrySecurityHelper.exe" {
+		t.Fatal("failed upgrade did not leave the previous build in place")
+	}
+	if _, err = os.Lstat(files[1].Destination + ".new"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("rejected staged file left behind")
 	}
 }
 

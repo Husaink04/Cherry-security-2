@@ -613,6 +613,10 @@ func Uninstall(ctx context.Context, preserveData bool) error {
 			return err
 		}
 	}
+	// Refuse before changing anything: a control program inside the install folder cannot delete itself.
+	if err = refuseRunningFromInstall(installDirectory); err != nil {
+		return err
+	}
 	manager, err := mgr.Connect()
 	if err != nil {
 		return err
@@ -653,8 +657,13 @@ func Uninstall(ctx context.Context, preserveData bool) error {
 			return err
 		}
 	}
-	for _, path := range []string{filepath.Join(installDirectory, "CherrySecurityAgent.exe"), filepath.Join(installDirectory, "CherrySecurityHelper.exe"), filepath.Join(installDirectory, "CherrySecurityControl.exe"), filepath.Join(installDirectory, "agent.json")} {
-		if removeError := os.Remove(path); removeError != nil && !errors.Is(removeError, os.ErrNotExist) {
+	installed := []string{"agent.json"}
+	for _, name := range upgradeBinaries {
+		// Leftovers from an interrupted upgrade are removed with the binaries they belong to.
+		installed = append(installed, name, name+".new", name+".old")
+	}
+	for _, name := range installed {
+		if removeError := removeWhenReleased(ctx, filepath.Join(installDirectory, name)); removeError != nil {
 			return removeError
 		}
 	}
@@ -665,12 +674,275 @@ func Uninstall(ctx context.Context, preserveData bool) error {
 		return nil
 	}
 	for _, name := range []string{"credential.dat", "agent-ca.crt", "queue.db", "queue.db-journal", "agent.log"} {
-		if removeError := os.Remove(filepath.Join(dataDirectory, name)); removeError != nil && !errors.Is(removeError, os.ErrNotExist) {
+		if removeError := removeWhenReleased(ctx, filepath.Join(dataDirectory, name)); removeError != nil {
 			return removeError
 		}
 	}
 	if err = os.Remove(dataDirectory); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	return nil
+}
+
+var upgradeBinaries = []string{"CherrySecurityAgent.exe", "CherrySecurityHelper.exe", "CherrySecurityControl.exe"}
+
+// retryWhileLocked repeats a file operation for up to 15 s while an exiting process still holds the file.
+func retryWhileLocked(ctx context.Context, operation func() error) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := operation()
+		if err == nil || !(errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_SHARING_VIOLATION)) || time.Now().After(deadline) {
+			return err
+		}
+		if !waitContext(ctx, 250*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
+}
+
+// removeWhenReleased deletes a file once a process that is still exiting releases it; a missing file is not an error.
+func removeWhenReleased(ctx context.Context, path string) error {
+	return retryWhileLocked(ctx, func() error {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
+}
+
+func runningFrom(executable, directory string) bool {
+	relative, err := filepath.Rel(strings.ToLower(filepath.Clean(directory)), strings.ToLower(filepath.Clean(executable)))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func refuseRunningFromInstall(installDirectory string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, resolveError := filepath.EvalSymlinks(executable); resolveError == nil {
+		executable = resolved
+	}
+	if runningFrom(executable, installDirectory) {
+		return fmt.Errorf("run the control program from its build or download folder, not from %s", installDirectory)
+	}
+	return nil
+}
+
+type UpgradeOptions struct {
+	ServiceBinary string
+	HelperBinary  string
+	ControlBinary string
+}
+
+type UpgradeFile struct {
+	Source      string
+	Destination string
+	OldSHA256   string
+	NewSHA256   string
+}
+
+type UpgradePlan struct {
+	InstallDirectory string
+	ServiceName      string
+	TaskName         string
+	Files            []UpgradeFile
+}
+
+// PlanUpgrade checks an existing installation and the new binaries without changing anything.
+func PlanUpgrade(ctx context.Context, options UpgradeOptions) (UpgradePlan, error) {
+	programFiles, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, windows.KF_FLAG_DEFAULT)
+	if err != nil {
+		return UpgradePlan{}, err
+	}
+	installDirectory := filepath.Join(programFiles, "CherrySecurity")
+	if err = rejectReparseAncestors(installDirectory); err != nil {
+		return UpgradePlan{}, err
+	}
+	if err = refuseRunningFromInstall(installDirectory); err != nil {
+		return UpgradePlan{}, err
+	}
+	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return UpgradePlan{}, err
+	}
+	defer windows.CloseServiceHandle(manager)
+	serviceName, err := windows.UTF16PtrFromString("CherrySecurityAgent")
+	if err != nil {
+		return UpgradePlan{}, err
+	}
+	service, err := windows.OpenService(manager, serviceName, windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		return UpgradePlan{}, errors.New("CherrySecurity service is not installed; use install instead")
+	}
+	windows.CloseServiceHandle(service)
+	taskPresent, err := helperTaskExists(ctx, "CherrySecurity Session Helper")
+	if err != nil {
+		return UpgradePlan{}, err
+	}
+	if !taskPresent {
+		return UpgradePlan{}, errors.New("CherrySecurity helper task is missing; reinstall instead")
+	}
+	if info, statError := os.Lstat(filepath.Join(installDirectory, "agent.json")); statError != nil || !info.Mode().IsRegular() {
+		return UpgradePlan{}, errors.New("installed agent.json is missing")
+	}
+	plan := UpgradePlan{InstallDirectory: installDirectory, ServiceName: "CherrySecurityAgent", TaskName: "CherrySecurity Session Helper"}
+	for index, source := range []string{options.ServiceBinary, options.HelperBinary, options.ControlBinary} {
+		destination := filepath.Join(installDirectory, upgradeBinaries[index])
+		newHash, hashError := sourceHash(source, 100<<20)
+		if hashError != nil {
+			return UpgradePlan{}, hashError
+		}
+		oldHash, hashError := sourceHash(destination, 100<<20)
+		if hashError != nil {
+			return UpgradePlan{}, hashError
+		}
+		plan.Files = append(plan.Files, UpgradeFile{Source: source, Destination: destination, OldSHA256: oldHash, NewSHA256: newHash})
+	}
+	return plan, nil
+}
+
+// replaceWithBackup swaps each binary for its verified new copy, keeping the previous one as <name>.old.
+// It returns the files already swapped so the caller can restore them.
+func replaceWithBackup(ctx context.Context, files []UpgradeFile) ([]UpgradeFile, error) {
+	swapped := []UpgradeFile{}
+	for _, file := range files {
+		staged, backup := file.Destination+".new", file.Destination+".old"
+		for _, leftover := range []string{staged, backup} {
+			if err := removeWhenReleased(ctx, leftover); err != nil {
+				return swapped, err
+			}
+		}
+		if err := copyExclusive(file.Source, staged); err != nil {
+			return swapped, err
+		}
+		if digest, err := sourceHash(staged, 100<<20); err != nil || digest != file.NewSHA256 {
+			_ = os.Remove(staged)
+			return swapped, errors.New("staged upgrade file failed integrity check")
+		}
+		if err := retryWhileLocked(ctx, func() error { return os.Rename(file.Destination, backup) }); err != nil {
+			_ = os.Remove(staged)
+			return swapped, err
+		}
+		if err := os.Rename(staged, file.Destination); err != nil {
+			_ = os.Rename(backup, file.Destination)
+			_ = os.Remove(staged)
+			return swapped, err
+		}
+		swapped = append(swapped, file)
+	}
+	return swapped, nil
+}
+
+// restoreBackups puts the previous binaries back in reverse order.
+func restoreBackups(ctx context.Context, swapped []UpgradeFile) error {
+	var first error
+	for index := len(swapped) - 1; index >= 0; index-- {
+		file := swapped[index]
+		err := retryWhileLocked(ctx, func() error { return os.Rename(file.Destination+".old", file.Destination) })
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func stopServiceAndWait(ctx context.Context, service *mgr.Service) error {
+	_, _ = service.Control(svc.Stop)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, err := service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("CherrySecurity service did not stop within 15 seconds")
+		}
+		if !waitContext(ctx, 250*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
+}
+
+// startAndConfirm starts the service and requires it to still be running after the settle time,
+// which catches a build that exits during startup.
+func startAndConfirm(ctx context.Context, service *mgr.Service, settle time.Duration) error {
+	if err := service.Start(); err != nil {
+		return err
+	}
+	if !waitContext(ctx, settle) {
+		return ctx.Err()
+	}
+	status, err := service.Query()
+	if err != nil {
+		return err
+	}
+	if status.State != svc.Running {
+		return fmt.Errorf("CherrySecurity service is not running after %s (state %d)", settle, status.State)
+	}
+	return nil
+}
+
+// ApplyUpgrade replaces the installed binaries in place, keeping the credential, queue, configuration and ACLs.
+// Any failure after the service stops restores the previous binaries and restarts the service.
+func ApplyUpgrade(ctx context.Context, plan UpgradePlan) error {
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		return errors.New("elevated administrator required")
+	}
+	if plan.ServiceName != "CherrySecurityAgent" || plan.TaskName != "CherrySecurity Session Helper" || len(plan.Files) != len(upgradeBinaries) {
+		return errors.New("invalid upgrade plan")
+	}
+	if err := refuseRunningFromInstall(plan.InstallDirectory); err != nil {
+		return err
+	}
+	for _, file := range plan.Files {
+		newHash, newError := sourceHash(file.Source, 100<<20)
+		oldHash, oldError := sourceHash(file.Destination, 100<<20)
+		if newError != nil || oldError != nil || newHash != file.NewSHA256 || oldHash != file.OldSHA256 {
+			return errors.New("installation or upgrade source changed since the plan")
+		}
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(plan.ServiceName)
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	stopHelperTask(ctx, plan.TaskName)
+	if err = stopServiceAndWait(ctx, service); err != nil {
+		return err
+	}
+	rollBack := func(swapped []UpgradeFile, cause error) error {
+		restoreError := restoreBackups(context.Background(), swapped)
+		startError := service.Start()
+		_ = runHelperTask(context.Background(), plan.TaskName)
+		if restoreError != nil {
+			return fmt.Errorf("upgrade failed (%v) and restoring the previous build also failed: %w", cause, restoreError)
+		}
+		if startError != nil {
+			return fmt.Errorf("upgrade failed (%v); previous build restored but the service did not start: %w", cause, startError)
+		}
+		return fmt.Errorf("upgrade failed; previous build restored: %w", cause)
+	}
+	swapped, err := replaceWithBackup(ctx, plan.Files)
+	if err != nil {
+		return rollBack(swapped, err)
+	}
+	if err = startAndConfirm(ctx, service, 10*time.Second); err != nil {
+		_ = stopServiceAndWait(context.Background(), service)
+		return rollBack(swapped, err)
+	}
+	// Best effort: the task also starts at the employee's next sign-in.
+	_ = runHelperTask(ctx, plan.TaskName)
+	for _, file := range plan.Files {
+		_ = removeWhenReleased(ctx, file.Destination+".old")
 	}
 	return nil
 }
