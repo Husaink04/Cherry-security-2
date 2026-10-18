@@ -178,7 +178,7 @@ func storeCredential(config Config, credential Credential) error {
 	return nil
 }
 
-func waitForEnrollment(ctx context.Context, config Config, client *Client) (Credential, error) {
+func waitForEnrollment(ctx context.Context, config Config, client *Client, serviceIdentity string) (Credential, error) {
 	if credential, err := loadCredential(config); err == nil {
 		return credential, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -193,7 +193,7 @@ func waitForEnrollment(ctx context.Context, config Config, client *Client) (Cred
 	result := make(chan Credential, 1)
 	failures := make(chan error, 1)
 	go func() {
-		failures <- ServeEnrollment(enrollmentContext, func(requestContext context.Context, key []byte) error {
+		failures <- ServeEnrollment(enrollmentContext, serviceIdentity, func(requestContext context.Context, key []byte) error {
 			credential, enrollError := client.Enroll(requestContext, Enrollment{Key: string(key), Hostname: hostname, OS: runtime.GOOS + "/" + runtime.GOARCH, Version: "m1", Simulated: false})
 			if enrollError != nil {
 				return enrollError
@@ -316,7 +316,12 @@ func RunService(ctx context.Context, config Config) error {
 		return err
 	}
 	defer queue.Close()
-	credential, err := waitForEnrollment(ctx, config, client)
+	// The enrollment pipe's DACL needs the service's own SID, so resolve it before listening.
+	serviceIdentity, err := ServiceIdentity()
+	if err != nil {
+		return err
+	}
+	credential, err := waitForEnrollment(ctx, config, client, serviceIdentity)
 	if err != nil {
 		return err
 	}
@@ -332,10 +337,6 @@ func RunService(ctx context.Context, config Config) error {
 		return err
 	}
 	engine, err := NewEngine(queue, policy, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	serviceIdentity, err := ServiceIdentity()
 	if err != nil {
 		return err
 	}

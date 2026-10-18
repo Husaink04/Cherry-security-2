@@ -290,8 +290,22 @@ func serveHelperConnection(connection net.Conn, binding SessionBinding, handler 
 	}
 }
 
-func ServeEnrollment(ctx context.Context, enroll func(context.Context, []byte) error) error {
-	listener, err := winio.ListenPipe(enrollmentPipe, &winio.PipeConfig{SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)", InputBufferSize: 4096, OutputBufferSize: 4096})
+// enrollmentPipeACL admits SYSTEM, administrators and the service itself; go-winio must reopen
+// the pipe for each new instance, so a DACL without the server's own SID fails Accept with access denied.
+func enrollmentPipeACL(serverSID string) (string, error) {
+	sid, err := windows.StringToSid(serverSID)
+	if err != nil || sid.String() != serverSID {
+		return "", errors.New("invalid enrollment server identity")
+	}
+	return "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;" + serverSID + ")", nil
+}
+
+func ServeEnrollment(ctx context.Context, serverSID string, enroll func(context.Context, []byte) error) error {
+	descriptor, err := enrollmentPipeACL(serverSID)
+	if err != nil {
+		return err
+	}
+	listener, err := winio.ListenPipe(enrollmentPipe, &winio.PipeConfig{SecurityDescriptor: descriptor, InputBufferSize: 4096, OutputBufferSize: 4096})
 	if err != nil {
 		return err
 	}

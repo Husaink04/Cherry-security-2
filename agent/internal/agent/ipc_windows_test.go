@@ -92,3 +92,53 @@ func TestCurrentUserNamedPipeAuthentication(t *testing.T) {
 		t.Fatal("pipe authentication timed out")
 	}
 }
+
+func TestEnrollmentPipeAdmitsItsOwnServer(t *testing.T) {
+	if _, err := enrollmentPipeACL("not-a-sid"); err == nil {
+		t.Fatal("malformed server identity accepted")
+	}
+	server := windows.GetCurrentProcessToken()
+	user, err := server.GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := enrollmentPipeACL(user.User.Sid.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"D:P", "(A;;GA;;;SY)", "(A;;GA;;;BA)", "(A;;GA;;;" + user.User.Sid.String() + ")"} {
+		if !strings.Contains(descriptor, required) {
+			t.Fatalf("enrollment pipe DACL missing %q", required)
+		}
+	}
+	// A DACL without the server's own SID made Accept fail with access denied, stopping the installed service.
+	name := `\\.\pipe\CherrySecurity-enrollment-test-` + token()
+	listener, err := winio.ListenPipe(name, &winio.PipeConfig{SecurityDescriptor: descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			connection.Close()
+		}
+		accepted <- acceptErr
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := winio.DialPipeContext(ctx, name)
+	if err != nil {
+		t.Fatalf("server identity could not connect to its own pipe: %v", err)
+	}
+	client.Close()
+	select {
+	case err = <-accepted:
+		if err != nil {
+			t.Fatalf("enrollment listener failed to accept: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("enrollment listener accept timed out")
+	}
+}
