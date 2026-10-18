@@ -20,8 +20,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if os.Getenv("GRANT_APP_ROLE") == "true" {
-		_, err = db.Exec(ctx, "GRANT USAGE ON SCHEMA public TO cherryapp; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO cherryapp")
-		if err != nil {
+		if err = app.GrantRuntimeRole(ctx, db, "cherryapp"); err != nil {
 			log.Fatal(err)
 		}
 	}

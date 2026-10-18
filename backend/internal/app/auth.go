@@ -39,7 +39,8 @@ func BootstrapOwner(ctx context.Context, db *pgxpool.Pool, email, password strin
 	if err != nil {
 		return err
 	}
-	tx, err := db.Begin(ctx)
+	// Bootstrap runs as the runtime role, so it may see only Product Owner rows.
+	tx, err := beginScoped(ctx, db, bootstrapScope)
 	if err != nil {
 		return err
 	}
@@ -61,33 +62,96 @@ func BootstrapOwner(ctx context.Context, db *pgxpool.Pool, email, password strin
 	return tx.Commit(ctx)
 }
 
-type attemptCounter struct {
-	mu    sync.Mutex
+const (
+	globalLoginLimit  = 180 // per minute; bounds bcrypt CPU across all clients
+	clientLoginLimit  = 20  // per minute per client address
+	accountLoginLimit = 5   // per 15 minutes per account email
+	loginLimiterKeys  = 10000
+)
+
+type window struct {
 	start time.Time
 	count int
 }
 
-func (a *App) permitLogin(address string) bool {
-	// One coarse global bucket bounds memory and avoids trusting forwarded client addresses.
-	value, _ := a.loginLimits.LoadOrStore("global", &attemptCounter{start: time.Now()})
-	bucket := value.(*attemptCounter)
-	bucket.mu.Lock()
-	defer bucket.mu.Unlock()
-	if time.Since(bucket.start) > time.Minute {
-		bucket.start = time.Now()
-		bucket.count = 0
+// windowLimiter counts attempts per key in fixed windows with a bounded key table.
+type windowLimiter struct {
+	mu      sync.Mutex
+	limit   int
+	period  time.Duration
+	maxKeys int
+	windows map[string]*window
+}
+
+func newWindowLimiter(limit int, period time.Duration, maxKeys int) *windowLimiter {
+	return &windowLimiter{limit: limit, period: period, maxKeys: maxKeys, windows: map[string]*window{}}
+}
+
+// add records one attempt and reports whether the key remains within its limit.
+func (l *windowLimiter) add(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	w, ok := l.windows[key]
+	if ok && now.Sub(w.start) >= l.period {
+		w.start, w.count = now, 0
 	}
-	bucket.count++
-	return bucket.count <= 30
+	if !ok {
+		if len(l.windows) >= l.maxKeys {
+			for k, old := range l.windows {
+				if now.Sub(old.start) >= l.period {
+					delete(l.windows, k)
+				}
+			}
+			if len(l.windows) >= l.maxKeys {
+				// Fail closed rather than grow memory without bound.
+				return false
+			}
+		}
+		w = &window{start: now}
+		l.windows[key] = w
+	}
+	w.count++
+	return w.count <= l.limit
+}
+
+func (l *windowLimiter) reset(key string) {
+	l.mu.Lock()
+	delete(l.windows, key)
+	l.mu.Unlock()
+}
+
+// clientAddress trusts X-Real-IP only behind the bundled proxy, which overwrites that header.
+func (a *App) clientAddress(r *http.Request) string {
+	if a.config.TrustProxyHeader {
+		if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+			return ip.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginFailed audits a rejected password without recording the submitted email or password.
+func (a *App) loginFailed(r *http.Request, org, account string) error {
+	tx, err := beginScoped(r.Context(), a.db, loginScope)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(r.Context())
+	if err = audit(r.Context(), tx, org, "", "login_failed", account); err != nil {
+		return err
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		return err
+	}
+	return &apiError{401, "invalid credentials"}
 }
 func (a *App) login(w http.ResponseWriter, r *http.Request) error {
 	if r.Header.Get("Origin") != a.config.Origin {
 		return forbidden()
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if !a.permitLogin(host) {
-		w.Header().Set("Retry-After", "60")
-		return &apiError{429, "login rate limit; retry after one minute"}
 	}
 	var input struct {
 		Email    string `json:"email"`
@@ -96,25 +160,39 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(w, r, &input); err != nil {
 		return err
 	}
+	now := time.Now()
+	if !a.globalLogins.add("global", now) || !a.clientLogins.add(a.clientAddress(r), now) {
+		w.Header().Set("Retry-After", "60")
+		return &apiError{429, "too many login attempts; retry after one minute"}
+	}
 	if len(input.Password) > 72 || len(input.Email) > 254 {
 		return &apiError{401, "invalid credentials"}
 	}
+	email := strings.ToLower(strings.TrimSpace(input.Email))
+	// Unknown emails are counted the same way so lockouts do not reveal which accounts exist.
+	account := digest("login:" + email)
+	if !a.accountLogins.add(account, now) {
+		w.Header().Set("Retry-After", "900")
+		return &apiError{429, "too many login attempts for this account; retry after 15 minutes"}
+	}
 	var user principal
 	var hash string
-	err := a.db.QueryRow(r.Context(), "SELECT id,password_hash,role,coalesce(organization_id,'') FROM accounts WHERE email=$1", strings.ToLower(strings.TrimSpace(input.Email))).Scan(&user.ID, &hash, &user.Role, &user.OrganizationID)
+	// The tenant is unknown until the account is found, so this lookup uses a narrow SECURITY DEFINER function.
+	err := a.db.QueryRow(r.Context(), "SELECT account_id,password_hash,account_role,organization_id FROM auth_login($1)", email).Scan(&user.ID, &hash, &user.Role, &user.OrganizationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW"), []byte(input.Password))
-		return &apiError{401, "invalid credentials"}
+		return a.loginFailed(r, "", "")
 	}
 	if err != nil {
 		return err
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(input.Password)) != nil {
-		return &apiError{401, "invalid credentials"}
+		return a.loginFailed(r, user.OrganizationID, user.ID)
 	}
+	a.accountLogins.reset(account)
 	token := RandomToken()
 	csrf := digest("csrf:" + token)
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}
@@ -139,7 +217,7 @@ func (a *App) require(role string, fn authenticated) endpoint {
 			return &apiError{401, "login required"}
 		}
 		var user principal
-		err = a.db.QueryRow(r.Context(), "SELECT a.id,a.role,coalesce(a.organization_id,''),s.csrf_hash FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=$1 AND s.expires_at>now()", digest(cookie.Value)).Scan(&user.ID, &user.Role, &user.OrganizationID, &user.CSRF)
+		err = a.db.QueryRow(r.Context(), "SELECT account_id,account_role,organization_id,csrf_hash FROM auth_session($1)", digest(cookie.Value)).Scan(&user.ID, &user.Role, &user.OrganizationID, &user.CSRF)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &apiError{401, "session expired or revoked"}
 		}

@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,14 +18,15 @@ import (
 )
 
 type Config struct {
-	Origin        string
-	SecureCookies bool
-	RequestTimeout time.Duration
+	Origin           string
+	SecureCookies    bool
+	TrustProxyHeader bool
+	RequestTimeout   time.Duration
 }
 type App struct {
-	db          *pgxpool.Pool
-	config      Config
-	loginLimits sync.Map
+	db                                        *pgxpool.Pool
+	config                                    Config
+	globalLogins, clientLogins, accountLogins *windowLimiter
 }
 type principal struct{ ID, Role, OrganizationID, CSRF string }
 type apiError struct {
@@ -77,8 +77,13 @@ func decode(w http.ResponseWriter, r *http.Request, value any) error {
 	return nil
 }
 func New(db *pgxpool.Pool, config Config) http.Handler {
-	if config.RequestTimeout == 0 { config.RequestTimeout = 12 * time.Second }
-	a := &App{db: db, config: config}
+	if config.RequestTimeout == 0 {
+		config.RequestTimeout = 12 * time.Second
+	}
+	a := &App{db: db, config: config,
+		globalLogins:  newWindowLimiter(globalLoginLimit, time.Minute, 1),
+		clientLogins:  newWindowLimiter(clientLoginLimit, time.Minute, loginLimiterKeys),
+		accountLogins: newWindowLimiter(accountLoginLimit, 15*time.Minute, loginLimiterKeys)}
 	mux := http.NewServeMux()
 	route := func(pattern string, fn endpoint) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
@@ -120,17 +125,20 @@ func New(db *pgxpool.Pool, config Config) http.Handler {
 	route("GET /api/owner/organizations/{id}/keys", a.require("product_owner", a.ownerKeys))
 	route("POST /api/owner/organizations/{id}/keys", a.require("product_owner", a.issueKeys))
 	route("POST /api/owner/keys/{id}/revoke", a.require("product_owner", a.revokeKey))
-	route("GET /api/org/keys", a.require("org", a.orgKeys))
+	route("GET /api/org/keys", a.require("org_admin", a.orgKeys))
 	route("POST /api/agent/enroll", a.enroll)
+	route("GET /api/agent/policy", a.device(a.agentPolicy))
 	route("POST /api/agent/heartbeat", a.device(a.heartbeat))
 	route("POST /api/agent/events", a.device(a.ingest))
 	route("GET /api/org/devices", a.require("org", a.devices))
 	route("GET /api/org/devices/{id}", a.require("org", a.deviceDetail))
 	route("GET /api/org/devices/{id}/services", a.require("org", a.services))
 	route("POST /api/org/devices/{id}/revoke", a.require("org_admin", a.revokeDevice))
+	route("PUT /api/org/devices/{id}/employee", a.require("org_admin", a.assignEmployee))
 	route("GET /api/org/reports/daily", a.require("org", a.daily))
 	route("GET /api/org/settings", a.require("org", a.getSettings))
 	route("PUT /api/org/settings", a.require("org_admin", a.updateSettings))
+	route("GET /api/org/audit", a.require("org_admin", a.orgAudit))
 	route("GET /api/", func(w http.ResponseWriter, r *http.Request) error { return missing() })
 	return mux
 }

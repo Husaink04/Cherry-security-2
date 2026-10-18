@@ -9,12 +9,12 @@ The initial deployment is accessible only through loopback SSH forwarding. Brows
 | Method and route | Access | Behavior |
 | --- | --- | --- |
 | GET `/healthz` | Public | Process liveness, independent of database |
-| GET `/readyz` | Public | 200 only with database access and supported database schema version 2 |
+| GET `/readyz` | Public | M0 deployed schema 2; M1 source requires schema 3 after its approved migration |
 | POST `/auth/login` | Public, exact Origin required | `{email,password}`; returns role, organization ID, and CSRF token; sets HttpOnly SameSite=Strict cookie |
 | GET `/auth/me` | Session | Returns role, organization ID, and session-bound CSRF token without rotating the session |
 | POST `/auth/logout` | Session + CSRF | Deletes the server session and expires its cookie |
 
-Session lifespan is eight hours. Passwords are bcrypt-hashed at cost 12; initial passwords must contain 14–72 bytes. The development API limits login attempts to 30 per minute per API process. Login, accounts, sessions, and all API data persist in PostgreSQL.
+Session lifespan is eight hours. Passwords are bcrypt-hashed at cost 12; initial passwords must contain 14–72 bytes. Each API process limits login attempts to 5 per 15 minutes per account email (known or unknown, so lockouts do not reveal which accounts exist), 20 per minute per client address, and 180 per minute overall to bound password-hashing CPU; exceeding a limit returns 429 with `Retry-After`, and a successful login resets the account counter. The client address comes from `X-Real-IP` only when `TRUST_PROXY_HEADER=true`, which Compose sets because the bundled nginx proxy overwrites that header; never enable it when the API is reachable without that proxy. Failed password checks are audited as `login_failed` with the account ID when known, never the submitted email or password. Login, accounts, sessions, and all API data persist in PostgreSQL.
 
 Every authenticated browser write requires the exact configured `Origin` and `X-CSRF-Token`. Roles are `product_owner`, `org_admin`, `org_viewer`. Owner provisioning authority does not confer activity access. Device bearer tokens never authenticate browser organization routes.
 
@@ -22,8 +22,8 @@ Every authenticated browser write requires the exact configured `Origin` and `X-
 
 | Method and route | Request / result |
 | --- | --- |
-| GET `/owner/organizations` | Returns up to 100 most recent organization metadata records |
-| POST `/owner/organizations` | `{name,timezone}`; returns new `{id}`; IANA timezone validated |
+| GET `/owner/organizations?q=...` | Up to 100 most recent organizations, optionally filtered by a case-insensitive literal name substring (at most 120 bytes), each with `admin_count`, `active_device_count`, and `unused_key_count` provisioning counts only |
+| POST `/owner/organizations` | `{name,timezone,admin?:{email,password},key_count?}` with `key_count` 0–100; returns `{id,admin_id?,keys?}` with key secrets once; IANA timezone validated; organization, first administrator, and keys are created in one transaction, so any failure (for example a duplicate administrator email, 409) creates nothing |
 | POST `/owner/organizations/{id}/admins` | `{email,password}`; creates an organization administrator |
 | POST `/owner/organizations/{id}/keys` | `{count}` with 1–100; returns `keys:[{id,secret,expires_at}]` once |
 | GET `/owner/organizations/{id}/keys` | Metadata only, up to 500 most recent keys |
@@ -45,7 +45,11 @@ POST `/agent/enroll`:
 }
 ```
 
-Returns `{device_id,device_token}` once. The organization comes exclusively from the key. M0 rejects real/non-simulated endpoint enrollment. Used, expired, and revoked keys return 401.
+Returns `{device_id,device_token}` once. The organization comes exclusively from the key. Deployed M0 rejects real/non-simulated enrollment; M1 source accepts and persists either explicit simulated state. Used, expired, and revoked keys return 401.
+
+M1 adds device-authenticated `GET /agent/policy`: schema version 1, stable policy hash, server UTC time, IANA timezone, idle seconds, collection schedule, raw retention and irreversible ingestion floor, upload interval 60 seconds, validity 86400 seconds. M1 native event schema 2 supports typed gap reasons while preserving schema 1 JSON/replay compatibility. Native heartbeat schema 2 reports collection/policy/queue/error/loss health; unsupported fields and counter rollback are rejected. Loss epochs are retained up to 64 per device; exceeding that bound requires explicit recovery. These source changes are not live until the separate rollout approval.
+
+M1 adds administrator-only `PUT /org/devices/{id}/employee` with `{employee_id}` (trimmed, at most 120 bytes). Assignment is tenant scoped and audited; an empty value unassigns. Product Owner and viewer roles cannot assign employee labels.
 
 After enrollment use `Authorization: Bearer <device_token>` for:
 
@@ -73,10 +77,13 @@ Identical event-ID retries are acknowledged without changing totals. A different
 | GET `/org/devices/{id}` | Admin/viewer; scoped device, up to 100 latest events, coverage, sequence-gap count |
 | GET `/org/devices/{id}/services` | Admin/viewer; up to 500 latest observed service states |
 | POST `/org/devices/{id}/revoke` | Admin only; future heartbeat/ingestion rejected |
-| GET `/org/keys` | Admin/viewer; organization-bound key metadata only |
+| GET `/org/keys` | Admin only; organization-bound key metadata only (viewers do not enroll devices) |
 | GET `/org/reports/daily?date=YYYY-MM-DD&device_id=...` | Admin/viewer; organization-local date, optional device filter, separate duration totals and breakdown |
 | GET `/org/settings` | Admin/viewer; organization name/timezone, idle threshold, collection schedule, retention |
 | PUT `/org/settings` | Admin only; validated settings and audit event |
+| GET `/org/audit?action=...&before=...&before_id=...` | Admin only; this organization's audit events, newest first, 100 per page with `has_more`; optional `action` from the fixed list; page with the last event's `created_at` and `id` together |
+
+Audit events show the actor as an email only for accounts in the same organization, `Product Owner` for the platform owner (never their email), `device <hostname>` for the organization's devices, and `system` or `unknown` otherwise. Targets resolve the same way. Unknown action filters and malformed cursors return 400.
 
 Unknown or cross-organization device IDs return 404. Settings writes include `idle_seconds` (60–3600), `raw_retention_days` (1–90), `summary_retention_days` (at least raw retention, at most 365), and `collection_schedule:{days,start,end,unrestricted}`. Weekdays use Sunday=0. Scheduled windows must end after start on the same day; overnight schedules are not yet supported. Timezone is selected at organization creation and immutable in M0 to preserve existing daily summaries.
 
@@ -88,6 +95,6 @@ Daily reports return at most 1,000 breakdown rows with an explicit truncation in
 
 Raw observations default to seven-day retention; summaries default to 30 days. Hourly cleanup applies each retention independently, removes expired sessions, and expires audit records after 90 days. Observations arriving older than raw retention are rejected explicitly, not reassigned to today. Existing summaries survive raw-event expiry. Cleanup advances a persistent ingestion watermark before deleting deduplication evidence; increasing retention cannot reopen expired history and double-count old replays.
 
-API runtime database access uses non-superuser `cherryapp`; migrations and local restore use `cherryowner`. No database port is published. Secrets reside in Kali's ignored, mode-600 `.env` and are not printed in setup logs. Avoid sharing `docker compose config` output without `--quiet`: it contains resolved secrets.
+API runtime database access uses non-superuser `cherryapp`; migrations and local restore use `cherryowner`. PostgreSQL row-level security (migration 004) is a second tenant boundary: every API transaction declares its scope, the API refuses to start as a role that bypasses row-level security, and pre-tenant lookups (login, session, device token, enrollment key) use narrow functions owned by the NOLOGIN `cherry_auth` role. No database port is published. Secrets reside in Kali's ignored, mode-600 `.env` and are not printed in setup logs. Avoid sharing `docker compose config` output without `--quiet`: it contains resolved secrets.
 
 The separate `browser-test` profile uses the dedicated `_test` database, synthetic accounts, a separate network, and loopback port 8082. It does not seed or replace the real Product Owner. Private fixture credentials are ignored by Git and must not be published with test artifacts.

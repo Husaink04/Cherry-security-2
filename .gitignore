@@ -9,6 +9,10 @@ artifacts/
 *.dump
 *.key
 *.pem
+*.crt
+*.csr
+*.p12
+*.pfx
 *.sqlite*
 node_modules/
 dist/
@@ -20,3 +24,5 @@ test-results/
 simulator-state.json
 browser-fixture.json
 backend/cherrysecurity
+*.exe
+*.test

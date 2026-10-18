@@ -31,9 +31,16 @@ func main() {
 	}
 	defer db.Close()
 	startup, startupCancel := context.WithTimeout(ctx, 10*time.Second)
-	if err = app.CheckSchema(startup, db); err != nil { startupCancel(); log.Fatal("database unavailable or schema incompatible; run the matching migrations") }
+	if err = app.CheckSchema(startup, db); err != nil {
+		startupCancel()
+		log.Fatal("database unavailable or schema incompatible; run the matching migrations")
+	}
+	if err = app.CheckRuntimeRole(startup, db); err != nil {
+		startupCancel()
+		log.Fatal("database role bypasses row-level security; connect as the restricted application role")
+	}
 	startupCancel()
-	server := &http.Server{Addr: ":8080", Handler: app.New(db, app.Config{Origin: origin, SecureCookies: parsed.Scheme == "https"}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	server := &http.Server{Addr: ":8080", Handler: app.New(db, app.Config{Origin: origin, SecureCookies: parsed.Scheme == "https", TrustProxyHeader: os.Getenv("TRUST_PROXY_HEADER") == "true"}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	go func() {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()

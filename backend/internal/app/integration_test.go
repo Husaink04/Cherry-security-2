@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -67,6 +68,14 @@ func (c *testClient) expect(method, path string, body any, bearer string, want i
 }
 func setupIntegration(t *testing.T) (*pgxpool.Pool, *httptest.Server, *testClient, func(string, string) *testClient) {
 	t.Helper()
+	fixture, _, server, owner, login := setupIntegrationPools(t)
+	return fixture, server, owner, login
+}
+
+// setupIntegrationPools returns a superuser fixture pool, which bypasses row-level security for
+// seeding and inspection, and the runtime pool the API uses as the restricted cherryapp role.
+func setupIntegrationPools(t *testing.T) (*pgxpool.Pool, *pgxpool.Pool, *httptest.Server, *testClient, func(string, string) *testClient) {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set; real PostgreSQL integration test skipped")
@@ -95,15 +104,32 @@ func setupIntegration(t *testing.T) (*pgxpool.Pool, *httptest.Server, *testClien
 	if err = Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	if err = BootstrapOwner(ctx, db, "owner@example.test", "Strong-owner-password-2026!"); err != nil {
+	if err = GrantRuntimeRole(ctx, db, "cherryapp"); err != nil {
+		t.Fatal(err)
+	}
+	runtimeConfig := db.Config()
+	// SET ROLE makes policies apply exactly as they do on the production API connection.
+	runtimeConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET ROLE cherryapp")
+		return err
+	}
+	runtimeDB, err := pgxpool.NewWithConfig(ctx, runtimeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = CheckRuntimeRole(ctx, runtimeDB); err != nil {
+		t.Fatal(err)
+	}
+	if err = BootstrapOwner(ctx, runtimeDB, "owner@example.test", "Strong-owner-password-2026!"); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewUnstartedServer(nil)
 	// Race instrumentation makes bcrypt substantially slower; keep production cost 12 unchanged.
-	server.Config.Handler = New(db, Config{Origin: "http://" + server.Listener.Addr().String(), RequestTimeout: 60 * time.Second})
+	server.Config.Handler = New(runtimeDB, Config{Origin: "http://" + server.Listener.Addr().String(), RequestTimeout: 60 * time.Second})
 	server.Start()
 	t.Cleanup(func() {
 		server.Close()
+		runtimeDB.Close()
 		db.Close()
 		_, _ = bootstrap.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
 		bootstrap.Close()
@@ -116,7 +142,7 @@ func setupIntegration(t *testing.T) (*pgxpool.Pool, *httptest.Server, *testClien
 		return c
 	}
 	owner := login("owner@example.test", "Strong-owner-password-2026!")
-	return db, server, owner, login
+	return db, runtimeDB, server, owner, login
 }
 
 func TestM0Workflow(t *testing.T) {

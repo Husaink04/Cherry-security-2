@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -21,7 +22,7 @@ func (a *App) device(fn deviceEndpoint) endpoint {
 			return &apiError{401, "device credentials required"}
 		}
 		var device devicePrincipal
-		err := a.db.QueryRow(r.Context(), "SELECT id,organization_id FROM devices WHERE token_hash=$1 AND revoked_at IS NULL", digest(strings.TrimPrefix(authorization, "Bearer "))).Scan(&device.ID, &device.OrganizationID)
+		err := a.db.QueryRow(r.Context(), "SELECT device_id,organization_id FROM auth_device($1)", digest(strings.TrimPrefix(authorization, "Bearer "))).Scan(&device.ID, &device.OrganizationID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &apiError{401, "device credential invalid or revoked"}
 		}
@@ -39,27 +40,107 @@ func collectorState(s string) bool {
 	return false
 }
 func (a *App) heartbeat(w http.ResponseWriter, r *http.Request, device devicePrincipal) error {
-	var input struct {
-		Helper    string `json:"helper"`
-		Extension string `json:"extension"`
-	}
-	if err := decode(w, r, &input); err != nil {
+	var rawInput json.RawMessage
+	if err := decode(w, r, &rawInput); err != nil {
 		return err
+	}
+	var input nativeHealth
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return invalid("invalid heartbeat")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(rawInput))
+	decoder.DisallowUnknownFields()
+	if input.Version == 0 || input.Version == 1 {
+		var legacy struct {
+			Version   int    `json:"schema_version"`
+			Helper    string `json:"helper"`
+			Extension string `json:"extension"`
+		}
+		if err := decoder.Decode(&legacy); err != nil {
+			return invalid("native heartbeat requires schema version 2")
+		}
+	} else if err := decoder.Decode(&input); err != nil {
+		return invalid("invalid native heartbeat")
 	}
 	if !collectorState(input.Helper) || !collectorState(input.Extension) {
 		return invalid("valid helper and extension status required")
 	}
-	tag, err := a.db.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2 WHERE id=$3 AND revoked_at IS NULL", input.Helper, input.Extension, device.ID)
+	if input.Version == 2 {
+		if !validHealth(input) {
+			return invalid("invalid native heartbeat")
+		}
+		tx, err := beginScoped(r.Context(), a.db, device.scope())
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(r.Context())
+		var raw []byte
+		if err = tx.QueryRow(r.Context(), "SELECT loss_counters FROM devices WHERE id=$1 AND revoked_at IS NULL FOR UPDATE", device.ID).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
+			return &apiError{401, "device revoked"}
+		} else if err != nil {
+			return err
+		}
+		counters := map[string]int64{}
+		if err = json.Unmarshal(raw, &counters); err != nil {
+			return err
+		}
+		previous, seen := counters[input.Epoch]
+		if (seen && input.Lost < previous) || (!seen && len(counters) >= 64) {
+			return &apiError{409, "loss counter epoch inconsistent; administrator recovery required"}
+		}
+		counters[input.Epoch] = input.Lost
+		var total int64
+		for _, value := range counters {
+			if value > 9007199254740991-total {
+				return invalid("total loss count exceeds supported range")
+			}
+			total += value
+		}
+		healthBytes, err := json.Marshal(input)
+		if err != nil {
+			return err
+		}
+		var health map[string]any
+		if err = json.Unmarshal(healthBytes, &health); err != nil {
+			return err
+		}
+		health["total_lost_events"] = total
+		healthBytes, err = json.Marshal(health)
+		if err != nil {
+			return err
+		}
+		counterBytes, err := json.Marshal(counters)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2,health=$3,health_received_at=now(),loss_counters=$4 WHERE id=$5", input.Helper, input.Extension, healthBytes, counterBytes, device.ID); err != nil {
+			return err
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			return err
+		}
+		return send(w, 200, map[string]any{"status": "accepted"})
+	}
+	if (input.Version != 0 && input.Version != 1) || input.State != "" || input.Policy != "" || input.PolicyAge != 0 || input.Epoch != "" || input.Error != "" || input.QueueEvents != 0 || input.QueueBytes != 0 || input.Lost != 0 {
+		return invalid("native heartbeat requires schema version 2")
+	}
+	updated := false
+	err := inScope(r.Context(), a.db, device.scope(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(r.Context(), "UPDATE devices SET last_contact=now(),helper_status=$1,extension_status=$2 WHERE id=$3 AND revoked_at IS NULL", input.Helper, input.Extension, device.ID)
+		updated = tag.RowsAffected() > 0
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if !updated {
 		return &apiError{401, "device revoked"}
 	}
 	return send(w, 200, map[string]any{"status": "accepted"})
 }
 
 type Payload struct {
+	GapReason   string    `json:"gap_reason,omitempty"`
 	Start       time.Time `json:"start,omitempty"`
 	End         time.Time `json:"end,omitempty"`
 	App         string    `json:"app,omitempty"`
@@ -92,7 +173,7 @@ func validateEvent(event Event, now time.Time, retention int) error {
 			return invalid("invalid service payload")
 		}
 		switch p.State {
-		case "running", "stopped", "paused", "start_pending", "stop_pending", "continue_pending", "pause_pending", "unknown":
+		case "running", "stopped", "paused", "start_pending", "stop_pending", "continue_pending", "pause_pending", "unknown", "removed":
 		default:
 			return invalid("unsupported service state")
 		}
@@ -147,10 +228,10 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 	if err := decode(w, r, &input); err != nil {
 		return err
 	}
-	if input.Version != 1 || len(input.Events) < 1 || len(input.Events) > 500 {
-		return invalid("schema version 1 and 1 to 500 events required")
+	if (input.Version != 1 && input.Version != 2) || len(input.Events) < 1 || len(input.Events) > 500 {
+		return invalid("schema version 1 or 2 and 1 to 500 events required")
 	}
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, device.scope())
 	if err != nil {
 		return err
 	}
@@ -176,6 +257,9 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 	accepted := []string{}
 	now := time.Now().UTC()
 	for _, event := range input.Events {
+		if event.Payload.GapReason != "" && (input.Version != 2 || event.Kind != "gap" || !allowed(event.Payload.GapReason, "helper_missing", "suspended", "logged_out", "unsupported_session", "clock_discontinuity", "queue_overflow", "local_storage_failure", "process_unavailable", "policy_expired")) {
+			return invalid("unsupported gap reason or event schema")
+		}
 		if err = validateEvent(event, now, days); err != nil {
 			return err
 		}
@@ -185,9 +269,10 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 		canonical, _ := json.Marshal(event)
 		hash := digest(string(canonical))
 		var existing string
-		err = tx.QueryRow(r.Context(), "SELECT content_hash FROM events WHERE device_id=$1 AND event_id=$2", device.ID, event.ID).Scan(&existing)
+		var existingVersion int
+		err = tx.QueryRow(r.Context(), "SELECT content_hash,wire_version FROM events WHERE device_id=$1 AND event_id=$2", device.ID, event.ID).Scan(&existing, &existingVersion)
 		if err == nil {
-			if existing != hash {
+			if existing != hash || existingVersion != input.Version {
 				return &apiError{409, "event ID has conflicting content"}
 			}
 			accepted = append(accepted, event.ID)
@@ -222,7 +307,7 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 		if event.Kind != "service" {
 			start, end = p.Start, p.End
 		}
-		if _, err = tx.Exec(r.Context(), "INSERT INTO events(device_id,event_id,session_id,sequence,observed_at,kind,starts_at,ends_at,payload,content_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", device.ID, event.ID, event.Session, event.Sequence, event.Observed, event.Kind, start, end, payload, hash); err != nil {
+		if _, err = tx.Exec(r.Context(), "INSERT INTO events(device_id,event_id,session_id,sequence,observed_at,kind,starts_at,ends_at,payload,content_hash,wire_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", device.ID, event.ID, event.Session, event.Sequence, event.Observed, event.Kind, start, end, payload, hash, input.Version); err != nil {
 			return err
 		}
 		if event.Kind != "service" {
@@ -248,7 +333,7 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request, device devicePrinci
 	return send(w, 200, map[string]any{"accepted_event_ids": accepted})
 }
 func (a *App) revokeDevice(w http.ResponseWriter, r *http.Request, user principal) error {
-	tx, err := a.db.Begin(r.Context())
+	tx, err := beginScoped(r.Context(), a.db, user.scope())
 	if err != nil {
 		return err
 	}

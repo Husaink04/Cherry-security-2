@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "./api";
-import { duration, reportDate, timestamp } from "./model";
-import type { Role } from "./model";
+import { can, duration, navigationFor, reportDate, timestamp } from "./model";
+import type { Page, Role } from "./model";
 import type { KeyMetadata } from "./owner";
 import { Brand, Badge, Empty, Panel, ErrorNotice } from "./ui";
+import { DeviceHealth } from "./device-health";
+import type { NativeHealth } from "./device-health";
+import { Overview } from "./overview";
+import { AuditLog } from "./audit";
+import type { AuditEvent } from "./audit";
 
-type Device = {
+export type Device = {
   id: string;
   hostname: string;
   employee_id: string;
@@ -18,6 +23,8 @@ type Device = {
   helper_status: string;
   extension_status: string;
   revoked_at: string | null;
+  health: NativeHealth | null;
+  health_received_at: string | null;
 };
 type Timeline = {
   event_id: string;
@@ -38,7 +45,7 @@ type Service = {
   startup_type: string;
   observed_at: string;
 };
-type ReportItem = {
+export type ReportItem = {
   device_id: string;
   hostname: string;
   simulated: boolean;
@@ -46,7 +53,7 @@ type ReportItem = {
   label: string;
   seconds: number;
 };
-type Report = {
+export type Report = {
   date: string;
   timezone: string;
   application_seconds: number;
@@ -73,11 +80,13 @@ type Settings = {
     unrestricted: boolean;
   };
 };
-const pages = [
-  ["devices", "◈", "Devices"],
-  ["reports", "▥", "Activity reports"],
-  ["keys", "⌘", "Enrollment keys"],
-  ["settings", "⚙", "Collection settings"],
+const pages: [Page, string, string, string][] = [
+  ["overview", "◎", "Overview", "Endpoint health and today's observed activity at a glance."],
+  ["devices", "◈", "Devices", "A clear picture of endpoint connectivity and collector health."],
+  ["reports", "▥", "Activity reports", "Observed activity, with browser time shown as a separate breakdown."],
+  ["keys", "⌘", "Enrollment keys", "Enrollment keys allocated to your organization by the Product Owner."],
+  ["settings", "⚙", "Collection settings", "Control collection boundaries and data retention."],
+  ["audit", "☰", "Audit log", "Security-relevant actions recorded for this organization."],
 ];
 export function Organization({
   role,
@@ -88,7 +97,12 @@ export function Organization({
   onLogout: () => void;
   busy: boolean;
 }) {
-  const [page, setPage] = useState("devices"),
+  const allowed = navigationFor(role),
+    visiblePages = pages.filter(([id]) => allowed.includes(id));
+  const [page, setPage] = useState<Page>("overview"),
+    [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]),
+    [auditAction, setAuditAction] = useState(""),
+    [auditMore, setAuditMore] = useState(false),
     [devices, setDevices] = useState<Device[]>([]),
     [selected, setSelected] = useState(""),
     [detail, setDetail] = useState<{
@@ -119,6 +133,7 @@ export function Organization({
       });
     return () => controller.abort();
   }, []);
+  const timezone = settings?.timezone || "";
   useEffect(() => {
     const controller = new AbortController();
     let live = true;
@@ -126,7 +141,36 @@ export function Organization({
     setError("");
     async function load() {
       try {
-        if (page === "devices") {
+        if (page === "overview") {
+          const inventory = await api<{ devices: Device[] }>(
+            "/org/devices",
+            "GET",
+            undefined,
+            controller.signal,
+          );
+          if (!live) return;
+          setDevices(inventory.devices);
+          // Wait for the organization timezone so "today" matches its reporting day.
+          if (timezone) {
+            const today = await api<Report>(
+              `/org/reports/daily?date=${encodeURIComponent(reportDate(timezone))}`,
+              "GET",
+              undefined,
+              controller.signal,
+            );
+            if (live) setReport(today);
+          }
+        } else if (page === "audit") {
+          const result = await api<{ events: AuditEvent[]; has_more: boolean }>(
+            `/org/audit${auditAction ? "?action=" + encodeURIComponent(auditAction) : ""}`,
+            "GET",
+            undefined,
+            controller.signal,
+          );
+          if (!live) return;
+          setAuditEvents(result.events);
+          setAuditMore(result.has_more);
+        } else if (page === "devices") {
           const result = await api<{ devices: Device[] }>(
             "/org/devices",
             "GET",
@@ -196,7 +240,7 @@ export function Organization({
     }
     void load();
     const timer =
-      page === "devices" || page === "reports"
+      page === "overview" || page === "devices" || page === "reports"
         ? window.setInterval(() => {
             if (document.visibilityState === "visible") void load();
           }, 30000)
@@ -206,12 +250,31 @@ export function Organization({
       controller.abort();
       if (timer) clearInterval(timer);
     };
-  }, [page, selected, date, refresh]);
-  function navigate(next: string) {
+  }, [page, selected, date, refresh, timezone, auditAction]);
+  function navigate(next: Page) {
+    // Pages outside the role are never shown; the API rejects their data regardless.
+    if (!allowed.includes(next)) return;
     setPage(next);
     setSelected("");
     setDetail(null);
+    setReport(null);
     setNotice("");
+  }
+  async function loadOlderAudit() {
+    const last = auditEvents[auditEvents.length - 1];
+    if (!last) return;
+    setWorking(true);
+    try {
+      const query = new URLSearchParams({ before: last.created_at, before_id: last.id });
+      if (auditAction) query.set("action", auditAction);
+      const result = await api<{ events: AuditEvent[]; has_more: boolean }>(`/org/audit?${query}`);
+      setAuditEvents((current) => [...current, ...result.events]);
+      setAuditMore(result.has_more);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Older audit events could not be loaded");
+    } finally {
+      setWorking(false);
+    }
   }
   async function revoke(device: Device) {
     if (
@@ -232,6 +295,26 @@ export function Organization({
       setWorking(false);
     }
   }
+  async function assignEmployee(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!detail || !can(role, "assign_employee")) return;
+    const employee = String(new FormData(event.currentTarget).get("employee_id") || "").trim();
+    if (new TextEncoder().encode(employee).length > 120 || /[\x00\r\n]/.test(employee)) {
+      setError("Employee identifier must be at most 120 bytes and one line.");
+      return;
+    }
+    setWorking(true);
+    setError("");
+    try {
+      await api(`/org/devices/${detail.device.id}/employee`, "PUT", { employee_id: employee });
+      setNotice("Employee identifier saved.");
+      setRefresh((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Employee identifier could not be saved");
+    } finally {
+      setWorking(false);
+    }
+  }
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!settings) return;
@@ -246,7 +329,7 @@ export function Organization({
         collection_schedule: settings.collection_schedule,
       });
       setNotice(
-        "Collection settings saved. M0 uses fixtures; endpoint enforcement begins with the real agent.",
+        "Collection settings saved. Native agents receive the updated policy on their next refresh.",
       );
     } catch (err) {
       setError(
@@ -256,7 +339,8 @@ export function Organization({
       setWorking(false);
     }
   }
-  const title = pages.find((value) => value[0] === page)?.[2] || "Devices";
+  const current = pages.find((value) => value[0] === page) || pages[0],
+    title = current[2];
   const online = devices.filter(
     (value) => value.connectivity === "online",
   ).length;
@@ -275,7 +359,7 @@ export function Organization({
         </div>
         <div className="sidebar-label">WORKSPACE</div>
         <nav aria-label="Organization navigation">
-          {pages.map(([id, icon, label]) => (
+          {visiblePages.map(([id, icon, label]) => (
             <button
               key={id}
               className={page === id ? "active" : ""}
@@ -287,9 +371,9 @@ export function Organization({
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <Badge tone="pilot">M0 PILOT</Badge>
+          <Badge tone="pilot">M1 PILOT</Badge>
           <p>
-            Simulated observations only.
+            Simulator and native endpoints are labeled.
             <br />
             Coverage is shown explicitly.
           </p>
@@ -310,26 +394,15 @@ export function Organization({
             <div>
               <div className="eyebrow">YOUR WORKSPACE, IN FOCUS</div>
               <h1>{title}</h1>
-              <p>
-                {page === "devices"
-                  ? "A clear picture of endpoint connectivity and collector health."
-                  : page === "reports"
-                    ? "Observed activity, with browser time shown as a separate breakdown."
-                    : page === "keys"
-                      ? "Enrollment keys allocated to your organization by the Product Owner."
-                      : "Control collection boundaries and data retention."}
-              </p>
+              <p>{current[3]}</p>
             </div>
             <span className="environment">
               <i /> Local development
             </span>
           </div>
           <div className="notice pilot-banner">
-            <Badge tone="pilot">SIMULATED</Badge>
-            <span>
-              This M0 workspace contains fixture telemetry. No employee
-              monitoring agent is installed.
-            </span>
+            <Badge tone="pilot">PILOT</Badge>
+            <span>Endpoint labels distinguish simulator data from native Windows observations. Check each device for collection coverage.</span>
           </div>
           <ErrorNotice message={error} />
           {notice && (
@@ -341,6 +414,27 @@ export function Organization({
             <p className="muted" role="status">
               Updating workspace…
             </p>
+          )}
+          {page === "overview" && (
+            <Overview
+              devices={devices}
+              report={report}
+              timezone={timezone || "Loading"}
+              onOpenDevice={(id) => {
+                navigate("devices");
+                setSelected(id);
+              }}
+            />
+          )}
+          {page === "audit" && can(role, "view_audit") && (
+            <AuditLog
+              events={auditEvents}
+              action={auditAction}
+              hasMore={auditMore}
+              loading={loading || working}
+              onFilter={setAuditAction}
+              onMore={loadOlderAudit}
+            />
           )}
           {page === "devices" && (
             <>
@@ -396,9 +490,7 @@ export function Organization({
                                 <strong>{device.hostname}</strong>
                                 <small className="cell-note">
                                   {device.os} ·{" "}
-                                  <span className="simulated-label">
-                                    SIMULATED
-                                  </span>
+                                  <span className="simulated-label">{device.simulated ? "SIMULATED" : "WINDOWS AGENT"}</span>
                                 </small>
                               </td>
                               <td>
@@ -437,7 +529,7 @@ export function Organization({
                     !loading && (
                       <Empty title="No endpoints enrolled yet">
                         Ask your Product Owner for an enrollment key, then run
-                        the M0 simulator in Kali.
+                        the simulator in Kali or enroll a Windows agent.
                       </Empty>
                     )
                   )}
@@ -455,7 +547,7 @@ export function Organization({
                     <Panel
                       title={detail.device.hostname}
                       description={`${detail.device.os} · Agent ${detail.device.agent_version}`}
-                      action={<Badge tone="pilot">SIMULATED</Badge>}
+                      action={<Badge tone={detail.device.simulated ? "pilot" : "green"}>{detail.device.simulated ? "SIMULATED" : "WINDOWS AGENT"}</Badge>}
                     >
                       <dl className="details">
                         <div>
@@ -475,13 +567,28 @@ export function Organization({
                           <dd>{timestamp(detail.device.last_contact)}</dd>
                         </div>
                       </dl>
+                      <DeviceHealth simulated={detail.device.simulated} connectivity={detail.device.connectivity} health={detail.device.health} receivedAt={detail.device.health_received_at} />
+                      {can(role, "assign_employee") ? (
+                        <form onSubmit={assignEmployee}>
+                          <label htmlFor="employee-id">Employee identifier</label>
+                          <input id="employee-id" name="employee_id" key={`${detail.device.id}:${detail.device.employee_id}`} defaultValue={detail.device.employee_id} maxLength={120} disabled={working} />
+                          <button className="secondary compact" type="submit" disabled={working}>Save identifier</button>
+                        </form>
+                      ) : (
+                        <dl className="details">
+                          <div>
+                            <dt>Employee identifier</dt>
+                            <dd>{detail.device.employee_id || "Not assigned"}</dd>
+                          </div>
+                        </dl>
+                      )}
                       {detail.sequence_gap_count > 0 && (
                         <div className="notice pilot-banner" role="status">
                           Detected sequence gaps: {detail.sequence_gap_count}.
                           Observations may be missing.
                         </div>
                       )}
-                      {role === "org_admin" && !detail.device.revoked_at && (
+                      {can(role, "revoke_device") && !detail.device.revoked_at && (
                         <button
                           className="secondary danger"
                           disabled={working}
@@ -668,7 +775,7 @@ export function Organization({
                                     />
                                   </div>
                                   <small>
-                                    {item.hostname} · SIMULATED{" "}
+                                    {item.hostname} · {item.simulated ? "SIMULATED" : "WINDOWS AGENT"}{" "}
                                     {index === 0 ? "· Most observed" : ""}
                                   </small>
                                 </div>
@@ -698,7 +805,7 @@ export function Organization({
               )}
             </>
           )}
-          {page === "keys" && (
+          {page === "keys" && can(role, "view_keys") && (
             <Panel
               title="Allocated enrollment keys"
               description="Only the Product Owner can issue keys. Request replacement if a secret was lost."
@@ -743,13 +850,13 @@ export function Organization({
               )}
             </Panel>
           )}
-          {page === "settings" && settings && (
+          {page === "settings" && can(role, "edit_settings") && settings && (
             <Panel
               title="Collection boundaries"
               description={`Reporting timezone: ${settings.timezone}. Set when the organization is created.`}
             >
               <form onSubmit={saveSettings}>
-                <fieldset disabled={role !== "org_admin" || working}>
+                <fieldset disabled={working}>
                   <div className="two-columns">
                     <label>
                       Idle threshold (seconds)
@@ -883,16 +990,14 @@ export function Organization({
                       </div>
                     </>
                   )}
-                  {role === "org_admin" && (
-                    <button className="primary" disabled={working}>
-                      Save collection settings
-                    </button>
-                  )}
+                  <button className="primary" disabled={working}>
+                    Save collection settings
+                  </button>
                 </fieldset>
               </form>
               <p className="muted">
-                M0 stores policy settings; fixtures do not represent schedule
-                enforcement. Real endpoint enforcement is verified in M1. Audit
+                Simulator fixtures do not enforce schedules. Native agents apply
+                policy after refresh; check device health for gaps or errors. Audit
                 records are retained for 90 days.
               </p>
             </Panel>

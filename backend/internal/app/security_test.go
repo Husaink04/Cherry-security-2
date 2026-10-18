@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +64,7 @@ func TestSessionExpiryViewerAndInputBoundaries(t *testing.T) {
 }
 
 func TestRetentionPreservesIndependentSummaryWindow(t *testing.T) {
-	db, _, owner, _ := setupIntegration(t)
+	db, runtimeDB, _, owner, _ := setupIntegrationPools(t)
 	ctx := context.Background()
 	org := owner.expect("POST", "/api/owner/organizations", map[string]any{"name": "Retention fixture", "timezone": "UTC"}, "", 201)["id"].(string)
 	device := RandomToken()
@@ -81,7 +83,8 @@ func TestRetentionPreservesIndependentSummaryWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err = Cleanup(ctx, db, now); err != nil {
+	// Cleanup runs as the runtime role so its retention scopes are exercised under row-level security.
+	if err = Cleanup(ctx, runtimeDB, now); err != nil {
 		t.Fatal(err)
 	}
 	var events, summaries int
@@ -94,6 +97,10 @@ func TestRetentionPreservesIndependentSummaryWindow(t *testing.T) {
 
 func TestEventValidation(t *testing.T) {
 	now := time.Now().UTC()
+	removed := Event{ID: "removed", Session: "session", Sequence: 2, Observed: now, Kind: "service", Payload: Payload{Service: "Spooler", State: "removed", StartupType: "unknown"}}
+	if err := validateEvent(removed, now, 7); err != nil {
+		t.Fatalf("removed service must be reportable: %v", err)
+	}
 	valid := Event{ID: "one", Session: "session", Sequence: 1, Observed: now, Kind: "browser", Payload: Payload{Hostname: "docs.example.com", Start: now.Add(-time.Minute), End: now}}
 	if err := validateEvent(valid, now, 7); err != nil {
 		t.Fatal(err)
@@ -125,5 +132,122 @@ func TestEventValidation(t *testing.T) {
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&e) == nil {
 		t.Fatal("unknown sensitive field accepted")
+	}
+}
+
+func TestWindowLimiter(t *testing.T) {
+	start := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	limiter := newWindowLimiter(2, time.Minute, 2)
+	if !limiter.add("a", start) || !limiter.add("a", start) || limiter.add("a", start) {
+		t.Fatal("limit not enforced at the third attempt")
+	}
+	later := start.Add(time.Minute)
+	if !limiter.add("a", later) || !limiter.add("b", later) {
+		t.Fatal("window did not reset or second key refused")
+	}
+	if limiter.add("c", later) {
+		t.Fatal("full key table must refuse new keys instead of growing")
+	}
+	expired := later.Add(time.Minute)
+	if !limiter.add("c", expired) || !limiter.add("c", expired) || limiter.add("c", expired) {
+		t.Fatal("expired keys were not pruned or limit not enforced")
+	}
+	limiter.reset("c")
+	if !limiter.add("c", expired) {
+		t.Fatal("reset did not clear attempts")
+	}
+}
+
+func TestLoginClientAddress(t *testing.T) {
+	request := httptest.NewRequest("POST", "/api/auth/login", nil)
+	request.RemoteAddr = "172.18.0.5:41234"
+	request.Header.Set("X-Real-IP", "203.0.113.9")
+	direct := &App{}
+	if got := direct.clientAddress(request); got != "172.18.0.5" {
+		t.Fatalf("untrusted header used to choose the rate-limit key: %s", got)
+	}
+	proxied := &App{config: Config{TrustProxyHeader: true}}
+	if got := proxied.clientAddress(request); got != "203.0.113.9" {
+		t.Fatalf("trusted proxy address ignored: %s", got)
+	}
+	request.Header.Set("X-Real-IP", "not-an-ip")
+	if got := proxied.clientAddress(request); got != "172.18.0.5" {
+		t.Fatalf("invalid proxy header must fall back to the connection address: %s", got)
+	}
+}
+
+func TestLoginThrottlingAndFailureAudit(t *testing.T) {
+	db, server, owner, login := setupIntegration(t)
+	ctx := context.Background()
+	org := owner.expect("POST", "/api/owner/organizations", map[string]any{"name": "Login fixture", "timezone": "UTC"}, "", 201)["id"].(string)
+	owner.expect("POST", "/api/owner/organizations/"+org+"/admins", map[string]any{"email": "locked@example.test", "password": "Strong-locked-password-2026!"}, "", 201)
+	owner.expect("POST", "/api/owner/organizations/"+org+"/admins", map[string]any{"email": "other@example.test", "password": "Strong-other-password-2026!"}, "", 201)
+	anonymous := &testClient{t: t, client: server.Client(), base: server.URL}
+	for range 5 {
+		anonymous.expect("POST", "/api/auth/login", map[string]any{"email": "locked@example.test", "password": "wrong-password-value"}, "", 401)
+	}
+	// The correct password is refused once the account is locked, so guessing cannot continue.
+	anonymous.expect("POST", "/api/auth/login", map[string]any{"email": "locked@example.test", "password": "Strong-locked-password-2026!"}, "", 429)
+	// Other accounts on the same client remain usable; one account cannot lock out everyone.
+	login("other@example.test", "Strong-other-password-2026!")
+	var failures, leaked int
+	db.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE action='login_failed' AND organization_id=$1", org).Scan(&failures)
+	if failures != 5 {
+		t.Fatalf("expected 5 audited login failures, got %d", failures)
+	}
+	db.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE target_id LIKE '%@%' OR detail::text LIKE '%@%' OR detail::text LIKE '%wrong-password%'").Scan(&leaked)
+	if leaked != 0 {
+		t.Fatal("audit records contain submitted credentials")
+	}
+	// Unknown accounts throttle identically so lockouts do not reveal which emails exist.
+	for range 5 {
+		anonymous.expect("POST", "/api/auth/login", map[string]any{"email": "ghost@example.test", "password": "wrong-password-value"}, "", 401)
+	}
+	anonymous.expect("POST", "/api/auth/login", map[string]any{"email": "ghost@example.test", "password": "wrong-password-value"}, "", 429)
+}
+
+func TestLoginClientLimit(t *testing.T) {
+	// Limits are checked before any password hash or database work, so a nil database proves that ordering.
+	origin := "http://127.0.0.1:8080"
+	a := &App{config: Config{Origin: origin},
+		globalLogins:  newWindowLimiter(globalLoginLimit, time.Minute, 1),
+		clientLogins:  newWindowLimiter(clientLoginLimit, time.Minute, loginLimiterKeys),
+		accountLogins: newWindowLimiter(accountLoginLimit, 15*time.Minute, loginLimiterKeys)}
+	now := time.Now()
+	for range clientLoginLimit {
+		a.clientLogins.add("192.0.2.10", now)
+	}
+	for range accountLoginLimit {
+		a.accountLogins.add(digest("login:other@example.test"), now)
+	}
+	attempt := func(address, email string) (int, string) {
+		request := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"email":"`+email+`","password":"wrong-password-value"}`))
+		request.RemoteAddr = address
+		request.Header.Set("Origin", origin)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		var rejected *apiError
+		if err := a.login(response, request); !errors.As(err, &rejected) {
+			t.Fatalf("expected a rate-limit rejection, got %v", err)
+		}
+		return rejected.status, response.Header().Get("Retry-After")
+	}
+	if status, retry := attempt("192.0.2.10:41234", "probe@example.test"); status != 429 || retry != "60" {
+		t.Fatalf("client over its limit got %d (Retry-After %q)", status, retry)
+	}
+	// Another client passes the client limit and stops only at its own account lock.
+	if status, retry := attempt("198.51.100.7:52000", "other@example.test"); status != 429 || retry != "900" {
+		t.Fatalf("one client's limit affected another client: %d (Retry-After %q)", status, retry)
+	}
+}
+
+func TestNativePolicyAgeBound(t *testing.T) {
+	health := nativeHealth{Version: 2, Helper: "healthy", Extension: "missing", State: "collecting", Policy: "v1", PolicyAge: 86400, Epoch: "epoch", Error: "none"}
+	if !validHealth(health) {
+		t.Fatal("valid policy age rejected")
+	}
+	health.PolicyAge = 86401
+	if validHealth(health) {
+		t.Fatal("out-of-range policy age accepted")
 	}
 }

@@ -30,7 +30,7 @@ test("owner provisions a tenant, enrollment replays safely, and administrator in
     page.getByRole("button", { name: "Activity reports", exact: true }),
   ).toHaveCount(0);
   await page.getByLabel("Organization name").fill(name);
-  await page.getByLabel("Reporting timezone").fill("Asia/Kolkata");
+  await page.getByLabel("Reporting timezone").selectOption("Asia/Kolkata");
   await page
     .getByRole("button", { name: "Create organization", exact: true })
     .click();
@@ -134,6 +134,10 @@ test("owner provisions a tenant, enrollment replays safely, and administrator in
     .getByLabel("Password", { exact: true })
     .fill(fixture.admin_password);
   await page.getByRole("button", { name: "Sign in →" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Overview", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Devices", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Devices", exact: true }),
   ).toBeVisible();

@@ -1,9 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent as SubmitEvent } from "react";
 import { api } from "./api";
-import { timestamp } from "./model";
+import { timestamp, timezones } from "./model";
 import { Brand, Badge, Empty, Panel, ErrorNotice } from "./ui";
-type Org = { id: string; name: string; timezone: string; created_at: string };
+type Org = {
+  id: string;
+  name: string;
+  timezone: string;
+  created_at: string;
+  admin_count: number;
+  active_device_count: number;
+  unused_key_count: number;
+};
+const zones = timezones();
 export type KeyMetadata = {
   id: string;
   status: string;
@@ -26,19 +35,38 @@ export function Owner({
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [working, setWorking] = useState(false),
-    [loading, setLoading] = useState(true);
-  async function refresh() {
-    const result = await api<{ organizations: Org[] }>("/owner/organizations");
+    [loading, setLoading] = useState(true),
+    [query, setQuery] = useState("");
+  // Keys issued during one-step creation survive the selection change that follows it.
+  const freshKeys = useRef<{ org: string; keys: IssuedKey[] } | null>(null);
+  async function refresh(search = query, signal?: AbortSignal) {
+    const result = await api<{ organizations: Org[] }>(
+      `/owner/organizations${search.trim() ? "?q=" + encodeURIComponent(search.trim()) : ""}`,
+      "GET",
+      undefined,
+      signal,
+    );
     setOrgs(result.organizations);
   }
   useEffect(() => {
-    refresh()
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, []);
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => {
+      refresh(query, abort.signal)
+        .catch((err) => {
+          if (err.name !== "AbortError") setError(err.message);
+        })
+        .finally(() => setLoading(false));
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      abort.abort();
+    };
+  }, [query]);
   useEffect(() => {
+    const fresh = freshKeys.current;
+    freshKeys.current = null;
     setKeys([]);
-    setIssued([]);
+    setIssued(fresh && fresh.org === selected ? fresh.keys : []);
     if (!selected) return;
     const abort = new AbortController();
     api<{ keys: KeyMetadata[] }>(
@@ -68,16 +96,35 @@ export function Owner({
   function createOrg(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget,
-      data = new FormData(form);
+      data = new FormData(form),
+      email = String(data.get("admin_email") || "").trim(),
+      password = String(data.get("admin_password") || ""),
+      keyCount = Number(data.get("key_count") || 0);
+    if (Boolean(email) !== Boolean(password)) {
+      setError("Enter both the first administrator's email and initial password, or neither.");
+      return;
+    }
     void action(async () => {
-      const result = await api<{ id: string }>("/owner/organizations", "POST", {
-        name: data.get("name"),
-        timezone: data.get("timezone"),
-      });
-      await refresh();
+      const result = await api<{ id: string; admin_id?: string; keys?: IssuedKey[] }>(
+        "/owner/organizations",
+        "POST",
+        {
+          name: data.get("name"),
+          timezone: data.get("timezone"),
+          ...(email ? { admin: { email, password } } : {}),
+          key_count: keyCount,
+        },
+      );
+      freshKeys.current = { org: result.id, keys: result.keys || [] };
+      setQuery("");
+      await refresh("");
       setSelected(result.id);
       form.reset();
-      setNotice("Organization created. Provision its administrator next.");
+      setNotice(
+        result.admin_id
+          ? "Organization and its first administrator created. Hand off credentials and any keys through your approved secure channel."
+          : "Organization created. Provision its administrator next.",
+      );
     });
   }
   function createAdmin(event: SubmitEvent<HTMLFormElement>) {
@@ -90,6 +137,7 @@ export function Owner({
         password: data.get("password"),
       });
       form.reset();
+      await refresh();
       setNotice(
         "Organization administrator created. Hand off credentials through your approved secure channel.",
       );
@@ -109,6 +157,7 @@ export function Owner({
         `/owner/organizations/${selected}/keys`,
       );
       setKeys(list.keys);
+      await refresh();
     });
   }
   function revoke(id: string) {
@@ -201,6 +250,16 @@ export function Owner({
               title="Customer workspaces"
               description="Select a workspace to manage its access."
             >
+              <label>
+                Search organizations
+                <input
+                  type="search"
+                  value={query}
+                  maxLength={120}
+                  placeholder="Name contains…"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </label>
               <label className="sr-only" htmlFor="organization-select">
                 Selected organization
               </label>
@@ -220,9 +279,15 @@ export function Owner({
               {loading ? (
                 <p role="status">Loading workspaces…</p>
               ) : !orgs.length ? (
-                <Empty title="Your first workspace starts here">
-                  Create an organization to begin provisioning.
-                </Empty>
+                query.trim() ? (
+                  <Empty title="No matching workspaces">
+                    No organization name contains “{query.trim()}”.
+                  </Empty>
+                ) : (
+                  <Empty title="Your first workspace starts here">
+                    Create an organization to begin provisioning.
+                  </Empty>
+                )
               ) : (
                 <div className="org-list">
                   {orgs.map((org) => (
@@ -237,9 +302,20 @@ export function Owner({
                       </span>
                       <span>
                         <strong>{org.name}</strong>
-                        <small>{org.timezone}</small>
+                        <small>
+                          {org.timezone} · {org.admin_count} admin
+                          {org.admin_count === 1 ? "" : "s"} ·{" "}
+                          {org.active_device_count} active device
+                          {org.active_device_count === 1 ? "" : "s"} ·{" "}
+                          {org.unused_key_count} unused key
+                          {org.unused_key_count === 1 ? "" : "s"}
+                        </small>
                       </span>
-                      <span>→</span>
+                      {org.admin_count === 0 ? (
+                        <Badge tone="pilot">No administrator</Badge>
+                      ) : (
+                        <span>→</span>
+                      )}
                     </button>
                   ))}
                 </div>
@@ -247,7 +323,7 @@ export function Owner({
             </Panel>
             <Panel
               title="Create organization"
-              description="A separate data boundary for each customer."
+              description="A separate data boundary for each customer. Add the first administrator and keys now, or later."
             >
               <form onSubmit={createOrg}>
                 <label>
@@ -261,13 +337,52 @@ export function Owner({
                 </label>
                 <label>
                   Reporting timezone
-                  <input
+                  <select
                     name="timezone"
                     required
-                    defaultValue="Asia/Kolkata"
-                    placeholder="Asia/Kolkata"
+                    defaultValue={zones.includes("Asia/Kolkata") ? "Asia/Kolkata" : "UTC"}
+                  >
+                    {zones.map((zone) => (
+                      <option key={zone} value={zone}>
+                        {zone}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  First admin email (optional)
+                  <input
+                    name="admin_email"
+                    type="email"
+                    autoComplete="off"
+                    maxLength={254}
                   />
                 </label>
+                <label>
+                  First admin password
+                  <input
+                    name="admin_password"
+                    type="password"
+                    minLength={14}
+                    maxLength={72}
+                    autoComplete="new-password"
+                  />
+                </label>
+                <label>
+                  Enrollment keys to issue now
+                  <input
+                    name="key_count"
+                    type="number"
+                    min={0}
+                    max={100}
+                    defaultValue={0}
+                  />
+                </label>
+                <p className="muted">
+                  Creation is all-or-nothing: if the administrator or keys
+                  cannot be created, no organization is created. The timezone
+                  cannot be changed later.
+                </p>
                 <button className="primary" disabled={working}>
                   Create organization
                 </button>
