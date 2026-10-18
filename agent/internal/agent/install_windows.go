@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -332,6 +334,19 @@ func protectHelperTask(ctx context.Context, plan InstallPlan) error {
 	return runTool(command)
 }
 
+const taskXMLHeader = `<?xml version="1.0" encoding="UTF-16"?>` + "\n"
+
+// utf16LEWithBOM encodes task XML the way schtasks /XML reads it; a UTF-8 file fails with "unable to switch the encoding".
+func utf16LEWithBOM(text []byte) []byte {
+	units := utf16.Encode([]rune(string(text)))
+	encoded := make([]byte, 2+2*len(units))
+	encoded[0], encoded[1] = 0xFF, 0xFE
+	for index, unit := range units {
+		binary.LittleEndian.PutUint16(encoded[2+2*index:], unit)
+	}
+	return encoded
+}
+
 func helperTaskXML(plan InstallPlan) ([]byte, error) {
 	type logonTrigger struct {
 		Enabled bool   `xml:"Enabled"`
@@ -384,7 +399,7 @@ func helperTaskXML(plan InstallPlan) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(xml.Header), encoded...), nil
+	return append([]byte(taskXMLHeader), encoded...), nil
 }
 
 func createHelperTask(ctx context.Context, plan InstallPlan) error {
@@ -398,7 +413,7 @@ func createHelperTask(ctx context.Context, plan InstallPlan) error {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if _, err = temporary.Write(encoded); err == nil {
+	if _, err = temporary.Write(utf16LEWithBOM(encoded)); err == nil {
 		err = temporary.Sync()
 	}
 	if closeError := temporary.Close(); err == nil {

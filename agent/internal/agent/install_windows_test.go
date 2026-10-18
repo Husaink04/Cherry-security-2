@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
 )
@@ -83,6 +85,29 @@ func TestManagedServiceRecoveryAndAdminStop(t *testing.T) {
 		if _, err := descriptorDACL(descriptor); err != nil {
 			t.Fatalf("invalid security descriptor: %v", err)
 		}
+	}
+}
+
+func TestHelperTaskFileIsUTF16(t *testing.T) {
+	plan := InstallPlan{UserSID: "S-1-5-21-1-2-3-1001", HelperPath: `C:\Program Files\CherrySecurity\CherrySecurityHelper.exe`, ConfigPath: `C:\Program Files\CherrySecurity\agent.json`}
+	definition, err := helperTaskXML(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// schtasks /XML rejects a UTF-8 declaration with "unable to switch the encoding".
+	if !strings.HasPrefix(string(definition), `<?xml version="1.0" encoding="UTF-16"?>`) {
+		t.Fatalf("task XML must declare UTF-16: %.60s", definition)
+	}
+	file := utf16LEWithBOM(definition)
+	if len(file) < 2 || file[0] != 0xFF || file[1] != 0xFE || len(file)%2 != 0 {
+		t.Fatal("task file must be UTF-16LE with a byte-order mark")
+	}
+	units := make([]uint16, (len(file)-2)/2)
+	for index := range units {
+		units[index] = binary.LittleEndian.Uint16(file[2+2*index:])
+	}
+	if string(utf16.Decode(units)) != string(definition) {
+		t.Fatal("UTF-16 task file does not round-trip to the original XML")
 	}
 }
 
