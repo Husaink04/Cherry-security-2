@@ -162,7 +162,7 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 | Agent TLS ingress (rest of Batch B) | Running on `192.168.193.129:8443`; server certificate expires 2026-11-17, renew by retiring `secrets/agent-tls` and rerunning `scripts/prepare-agent-tls.py` |
 | M0 acceptance tests / backup restore | Passed; see linked verification report |
 | Actual Product Owner | Created interactively; database count verified |
-| M1 Windows agent source | On `main`; installed build `artifacts\agent\batch-c5` from `5e5c246` (unsigned); see M1 results |
+| M1 Windows agent source | On `main`; installed build `artifacts\agent\batch-c6` from `fec4c6e` (unsigned), reached by in-place upgrade; see M1 results |
 | Real Windows monitoring agent | Installed and enrolled on the owner's PC for `husain\husai`; helper healthy and uploading. Batch D (activity, lock/suspend, outage, revocation, eight-hour measurement) still requires approval |
 
 Use the [M0 operations guide](M0-DEVELOPMENT.md), [M0 results](testing/m0-results.md), [M1 Windows operations guide](M1-WINDOWS-OPERATIONS.md), and [M1 results](testing/m1-results.md). M1 deployment and endpoint acceptance remain separately approved batches.

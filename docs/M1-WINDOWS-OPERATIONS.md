@@ -21,7 +21,7 @@ bash /home/husain/cherrysecurity-m0/scripts/build-agent.sh
 
 It writes three Windows x64 binaries and `SHA256SUMS` under `/home/husain/cherrysecurity-m0/artifacts/agent`. The service and helper are linked as Windows GUI processes so they do not create console windows; the control program remains a console tool for explicit administrator operations.
 
-On Windows the same binaries can be built with the project-local toolchain (`D:\Cherry-security\artifacts\go-toolchain`) from a clean, committed tree, with `GOOS=windows GOARCH=amd64 CGO_ENABLED=0`, `-trimpath -buildvcs=false`, and `-ldflags "-s -w -H=windowsgui"` for the service and helper. Build each release into a new folder under `artifacts\agent` with its `SHA256SUMS` and the source commit; the 2026-10-18 Batch C install used `artifacts\agent\batch-c5` built from `5e5c246`.
+On Windows the same binaries can be built with the project-local toolchain (`D:\Cherry-security\artifacts\go-toolchain`) from a clean, committed tree, with `GOOS=windows GOARCH=amd64 CGO_ENABLED=0`, `-trimpath -buildvcs=false`, and `-ldflags "-s -w -H=windowsgui"` for the service and helper. Build each release into a new folder under `artifacts\agent` with its `SHA256SUMS` and the source commit; the 2026-10-18 Batch C install used `artifacts\agent\batch-c5` built from `5e5c246`, then was upgraded in place to `artifacts\agent\batch-c6` built from `fec4c6e`.
 
 The current M1 artifacts are unsigned development builds. Use them only on the approved local test endpoint. A commercial release must use the organization's protected code-signing process, timestamp signatures, publish signer identity and hashes, and verify those signatures before installation or upgrade.
 
@@ -35,7 +35,15 @@ Batch C approval is required before running either install command. Use the actu
 
 After reviewing that exact JSON plan, rerun the same command from an elevated console with `--action install`. Installation refuses an existing service, scheduled task, install directory, data directory, changed source hash, reparse-point source, or non-HTTPS endpoint. It creates only the resources in the displayed plan, and any failure rolls back everything it created; the error names the failing tool and quotes its output. The helper task starts at the selected user's next sign-in if that user is not signed in during installation.
 
-There is no in-place upgrade yet: because installation refuses an existing data directory, replacing a build means revoking the device in the console, uninstalling with `--delete-data`, installing the new build, and enrolling with a new key.
+## Upgrade
+
+To replace the binaries of an installed agent while keeping its enrollment, credential, queue, configuration and ACLs, run the new build's control program from an elevated console in its build folder:
+
+```powershell
+& 'D:\Cherry-security\artifacts\agent\batch-cN\CherrySecurityControl-m1.exe' --action upgrade --service 'D:\Cherry-security\artifacts\agent\batch-cN\CherrySecurityAgent-m1.exe' --helper 'D:\Cherry-security\artifacts\agent\batch-cN\CherrySecurityHelper-m1.exe' --control 'D:\Cherry-security\artifacts\agent\batch-cN\CherrySecurityControl-m1.exe'
+```
+
+It refuses to run from the install folder, or when the service, helper task or `agent.json` is missing, and it prints the old and new SHA-256 of each binary before changing anything. It then ends the helper task, stops the service, swaps each binary through a hash-verified `.new` copy while keeping the previous file as `.old`, starts the service, and requires it to still be running after 10 seconds. Any failure after the service stops restores the previous binaries and restarts the service. On success the `.old` files are removed and the helper task is started. The endpoint and CA are not changed by an upgrade; changing them still needs an uninstall and a fresh install.
 
 The service is delayed automatic under LocalService. Crash recovery is restart after 10, 30, and 60 seconds, then no action, with a one-day reset. Recovery is disabled for orderly non-crash stops, so an administrator stop remains effective. Authenticated users can query service status but cannot start, stop, delete, or reconfigure it.
 
@@ -53,13 +61,13 @@ The service validates the key with the scoped HTTPS endpoint, protects the retur
 
 The selected employee sees `CherrySecurity Agent` in the notification area and can click it to read the collection notice and health. There is no employee stop or uninstall control.
 
-An elevated administrator can use Windows Service Control Manager to stop or start `CherrySecurityAgent`. The scheduled helper does not restart the service. To uninstall while preserving the queue, credential, CA, and logs by default, run the control program from its build folder, not from the install folder (it cannot delete its own running executable):
+An elevated administrator can use Windows Service Control Manager to stop or start `CherrySecurityAgent`. The scheduled helper does not restart the service. To uninstall while preserving the queue, credential, CA, and logs by default, run the control program from its build folder:
 
 ```powershell
-& 'D:\Cherry-security\artifacts\agent\batch-c5\CherrySecurityControl-m1.exe' --action uninstall
+& 'D:\Cherry-security\artifacts\agent\batch-c6\CherrySecurityControl-m1.exe' --action uninstall
 ```
 
-If it reports `remove …CherrySecurityHelper.exe: Access is denied`, the helper was still exiting; wait a few seconds and run the same command again, which is safe to repeat. Both issues are known defects to fix. Deleting `C:\ProgramData\CherrySecurity` requires the separate affirmative `--delete-data` flag. Uninstall refuses reparse-point paths and removes only the fixed CherrySecurity service, task, known binaries, configuration, and known data files; unexpected files make directory removal fail instead of being recursively deleted.
+Uninstall refuses, before changing anything, when it is run from the install folder, because a running program cannot delete itself. It waits up to 15 seconds for an exiting helper to release its executable, removes `.new`/`.old` leftovers of an interrupted upgrade, and is safe to repeat. Deleting `C:\ProgramData\CherrySecurity` requires the separate affirmative `--delete-data` flag. Uninstall refuses reparse-point paths and removes only the fixed CherrySecurity service, task, known binaries, configuration, and known data files; unexpected files make directory removal fail instead of being recursively deleted.
 
 ## Verification gates
 
