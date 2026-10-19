@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,11 +20,19 @@ import (
 )
 
 type Config struct {
-	Endpoint      string `json:"endpoint"`
-	TrustPath     string `json:"trust_path"`
-	DataDirectory string `json:"data_directory"`
-	UserSID       string `json:"user_sid"`
-	ServicePath   string `json:"service_path"`
+	Endpoint      string                `json:"endpoint"`
+	TrustPath     string                `json:"trust_path"`
+	DataDirectory string                `json:"data_directory"`
+	UserSID       string                `json:"user_sid"`
+	ServicePath   string                `json:"service_path"`
+	SystemEvents  <-chan SystemBoundary `json:"-"`
+}
+
+type SystemBoundary struct {
+	State     string
+	At        time.Time
+	Monotonic time.Duration
+	Session   string
 }
 
 func (config Config) Validate() error {
@@ -168,7 +178,7 @@ func storeCredential(config Config, credential Credential) error {
 	return nil
 }
 
-func waitForEnrollment(ctx context.Context, config Config, client *Client) (Credential, error) {
+func waitForEnrollment(ctx context.Context, config Config, client *Client, serviceIdentity string) (Credential, error) {
 	if credential, err := loadCredential(config); err == nil {
 		return credential, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -183,7 +193,7 @@ func waitForEnrollment(ctx context.Context, config Config, client *Client) (Cred
 	result := make(chan Credential, 1)
 	failures := make(chan error, 1)
 	go func() {
-		failures <- ServeEnrollment(enrollmentContext, func(requestContext context.Context, key []byte) error {
+		failures <- ServeEnrollment(enrollmentContext, serviceIdentity, func(requestContext context.Context, key []byte) error {
 			credential, enrollError := client.Enroll(requestContext, Enrollment{Key: string(key), Hostname: hostname, OS: runtime.GOOS + "/" + runtime.GOARCH, Version: "m1", Simulated: false})
 			if enrollError != nil {
 				return enrollError
@@ -216,15 +226,77 @@ func ServiceIdentity() (string, error) {
 	return sid.String(), nil
 }
 
-func safeState(sample Sample) string {
+func policyUsableAt(policy Policy, now time.Time) error {
+	if err := ValidatePolicy(policy); err != nil || policy.ServerTime.After(now.Add(2*time.Minute)) || !now.Before(policy.ServerTime.Add(time.Duration(policy.ValidForSeconds)*time.Second)) {
+		return errors.New("policy time invalid or expired")
+	}
+	return nil
+}
+
+func selectStartupPolicy(queue *Queue, now time.Time, fetch func() (Policy, error)) (Policy, bool, error) {
+	fresh, err := fetch()
+	if err == nil {
+		if validationError := policyUsableAt(fresh, now); validationError == nil {
+			return fresh, false, nil
+		} else {
+			err = validationError
+		}
+	}
+	if IsCredentialRejected(err) {
+		return Policy{}, false, err
+	}
+	checkpoint, cacheError := queue.LoadCheckpoint()
+	if cacheError != nil || policyUsableAt(checkpoint.Policy, now) != nil {
+		return Policy{}, false, errors.New("fresh and cached policy unavailable")
+	}
+	return checkpoint.Policy, true, nil
+}
+
+func safeState(sample Sample, policy Policy) string {
 	switch sample.State {
 	case "active":
+		if !policy.Allows(sample.At) {
+			return "outside_schedule"
+		}
+		if sample.LastInputAge >= time.Duration(policy.IdleSeconds)*time.Second {
+			return "idle"
+		}
 		return "collecting"
 	case "idle", "locked", "outside_schedule", "suspended", "logged_out", "unsupported_session", "helper_missing":
 		return sample.State
 	default:
 		return "error"
 	}
+}
+
+func jitteredRetry(base time.Duration, jitter uint32) time.Duration {
+	const maximum = 5 * time.Minute
+	if base > maximum {
+		base = maximum
+	}
+	delay := base*3/4 + time.Duration(jitter%51)*base/100
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func randomRetry(base time.Duration) time.Duration {
+	var data [4]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return jitteredRetry(base, 25)
+	}
+	return jitteredRetry(base, binary.LittleEndian.Uint32(data[:]))
+}
+
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
 }
 
 func RunService(ctx context.Context, config Config) error {
@@ -244,11 +316,19 @@ func RunService(ctx context.Context, config Config) error {
 		return err
 	}
 	defer queue.Close()
-	credential, err := waitForEnrollment(ctx, config, client)
+	// The enrollment pipe's DACL needs the service's own SID, so resolve it before listening.
+	serviceIdentity, err := ServiceIdentity()
 	if err != nil {
 		return err
 	}
-	policy, err := client.Policy(ctx, credential.Token)
+	credential, err := waitForEnrollment(ctx, config, client, serviceIdentity)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	policy, cached, err := selectStartupPolicy(queue, now, func() (Policy, error) {
+		return client.Policy(ctx, credential.Token)
+	})
 	if err != nil {
 		if IsCredentialRejected(err) {
 			<-ctx.Done()
@@ -260,31 +340,92 @@ func RunService(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	serviceIdentity, err := ServiceIdentity()
-	if err != nil {
-		return err
-	}
 	state := newRuntimeStatus("helper_missing")
-	state.update(func(status *Status) { status.Policy = "current" })
+	state.update(func(status *Status) {
+		if cached {
+			status.Policy = "cached"
+		} else {
+			status.Policy = "current"
+		}
+	})
 	started := time.Now()
-	collectorContext, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var collection struct {
+		sync.RWMutex
+		enabled   bool
+		permanent bool
+	}
+	collection.enabled = true
+	// Service inventory ends with a permanent stop; the helper pipe stays up so the tray can show why.
+	servicesContext, stopServices := context.WithCancel(ctx)
+	defer stopServices()
+	stopCollection := func(collectionState, policyState, lastError string, permanent bool) {
+		collection.Lock()
+		collection.enabled = false
+		collection.permanent = collection.permanent || permanent
+		collection.Unlock()
+		if permanent {
+			stopServices()
+		}
+		state.update(func(value *Status) {
+			value.State = collectionState
+			value.Policy = policyState
+			value.LastError = lastError
+		})
+	}
+	resumeCollection := func() bool {
+		collection.Lock()
+		defer collection.Unlock()
+		if collection.permanent {
+			return false
+		}
+		collection.enabled = true
+		return true
+	}
+	isPermanent := func() bool {
+		collection.RLock()
+		defer collection.RUnlock()
+		return collection.permanent
+	}
 	binding := SessionBinding{UserSID: config.UserSID, SessionID: ^uint32(0), ServiceSID: serviceIdentity, ServicePath: config.ServicePath}
 	go func() {
-		_ = listenHelperPipe(collectorContext, binding, func(message HelperMessage) (HelperReply, error) {
+		_ = listenHelperPipe(ctx, binding, func(message HelperMessage) (HelperReply, error) {
 			checkpoint := engine.Checkpoint()
 			if message.Kind == "hello" || message.Kind == "status" {
 				state.update(func(value *Status) { value.Helper = "healthy" })
 				status := state.get()
 				return HelperReply{Policy: &checkpoint.Policy, Status: &status, State: "connected"}, nil
 			}
+			collection.RLock()
+			if !collection.enabled {
+				collection.RUnlock()
+				status := state.get()
+				return HelperReply{Status: &status, State: "stopped"}, nil
+			}
+			if policyUsableAt(checkpoint.Policy, time.Now().UTC()) != nil {
+				collection.RUnlock()
+				stopCollection("policy_unavailable", "unavailable", "policy", false)
+				status := state.get()
+				return HelperReply{Status: &status, State: "stopped"}, nil
+			}
 			if err := engine.ObserveMessage(message); err != nil {
+				collection.RUnlock()
 				return HelperReply{}, err
 			}
 			last := message.Samples[len(message.Samples)-1]
-			state.update(func(value *Status) { value.State = safeState(last); value.Helper = "healthy"; value.LastError = "none" })
-			return HelperReply{State: "acknowledged"}, nil
+			state.update(func(value *Status) {
+				value.State = safeState(last, checkpoint.Policy)
+				value.Helper = "healthy"
+				value.LastError = "none"
+			})
+			collection.RUnlock()
+			status := state.get()
+			return HelperReply{Status: &status, State: "acknowledged"}, nil
 		}, func() {
+			collection.RLock()
+			defer collection.RUnlock()
+			if !collection.enabled {
+				return
+			}
 			_ = engine.MarkHelperMissing(time.Now().UTC(), time.Since(started), "console")
 			state.update(func(value *Status) {
 				value.State = "helper_missing"
@@ -294,50 +435,104 @@ func RunService(ctx context.Context, config Config) error {
 		})
 	}()
 	go func() {
-		if observeError := ObserveServices(collectorContext, engine.ObserveService); observeError != nil && collectorContext.Err() == nil {
+		observe := func(observation ServiceObservation) error {
+			collection.RLock()
+			defer collection.RUnlock()
+			if !collection.enabled {
+				return nil
+			}
+			return engine.ObserveService(observation)
+		}
+		if observeError := ObserveServices(servicesContext, observe); observeError != nil && servicesContext.Err() == nil {
 			state.update(func(value *Status) { value.LastError = "inventory" })
 		}
 	}()
 	policyTicker := time.NewTicker(time.Minute)
-	deliveryTicker := time.NewTicker(time.Duration(policy.UploadSeconds) * time.Second)
+	deliveryTimer := time.NewTimer(time.Duration(policy.UploadSeconds) * time.Second)
 	heartbeatTicker := time.NewTicker(time.Minute)
 	defer policyTicker.Stop()
-	defer deliveryTicker.Stop()
+	defer deliveryTimer.Stop()
 	defer heartbeatTicker.Stop()
+	retryBase := 2 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case boundary := <-config.SystemEvents:
+			collection.RLock()
+			if collection.enabled {
+				if boundary.At.IsZero() {
+					boundary.At = time.Now().UTC()
+				}
+				if boundary.Session == "" {
+					boundary.Session = "console"
+				}
+				if boundary.Monotonic == 0 {
+					boundary.Monotonic = time.Since(started)
+				}
+				if boundaryError := engine.MarkSystemBoundary(boundary.At, boundary.Monotonic, boundary.Session, boundary.State); boundaryError == nil {
+					state.update(func(value *Status) { value.State = boundary.State })
+				}
+			}
+			collection.RUnlock()
 		case <-policyTicker.C:
+			if isPermanent() {
+				continue
+			}
 			fresh, policyError := client.Policy(ctx, credential.Token)
 			if IsCredentialRejected(policyError) {
-				cancel()
-				state.update(func(value *Status) {
-					value.State = "revoked"
-					value.Policy = "unavailable"
-					value.LastError = "credential"
-				})
-				<-ctx.Done()
-				return nil
+				stopCollection("revoked", "unavailable", "credential", true)
+				continue
 			}
-			if policyError != nil || engine.UpdatePolicy(fresh, time.Now().UTC()) != nil {
-				state.update(func(value *Status) { value.Policy = "unavailable"; value.LastError = "policy" })
+			updateError := policyError
+			if updateError == nil {
+				updateError = engine.UpdatePolicy(fresh, time.Now().UTC())
+			}
+			if updateError != nil {
+				// A fetched policy that could not be stored is a local storage problem, not a policy one.
+				reason := "policy"
+				if policyError == nil {
+					reason = "storage"
+				}
+				if policyUsableAt(policy, time.Now().UTC()) != nil {
+					stopCollection("policy_unavailable", "unavailable", reason, false)
+				} else {
+					state.update(func(value *Status) { value.Policy = "cached"; value.LastError = reason })
+				}
 			} else {
 				policy = fresh
-				deliveryTicker.Reset(time.Duration(policy.UploadSeconds) * time.Second)
-				state.update(func(value *Status) { value.Policy = "current"; value.LastError = "none" })
+				resetTimer(deliveryTimer, time.Duration(policy.UploadSeconds)*time.Second)
+				if resumeCollection() {
+					state.update(func(value *Status) { value.Policy = "current"; value.LastError = "none" })
+				}
 			}
-		case <-deliveryTicker.C:
+		case <-deliveryTimer.C:
+			if isPermanent() {
+				resetTimer(deliveryTimer, 5*time.Minute)
+				continue
+			}
 			if deliveryError := engine.Deliver(ctx, client, credential.Token); deliveryError != nil {
 				if IsCredentialRejected(deliveryError) {
-					cancel()
-					state.update(func(value *Status) { value.State = "revoked"; value.LastError = "credential" })
-					<-ctx.Done()
-					return nil
+					stopCollection("revoked", "unavailable", "credential", true)
+					resetTimer(deliveryTimer, 5*time.Minute)
+					continue
 				}
 				state.update(func(value *Status) { value.LastError = "network" })
+				resetTimer(deliveryTimer, randomRetry(retryBase))
+				if retryBase < 5*time.Minute {
+					retryBase *= 2
+					if retryBase > 5*time.Minute {
+						retryBase = 5 * time.Minute
+					}
+				}
+			} else {
+				retryBase = 2 * time.Second
+				resetTimer(deliveryTimer, time.Duration(policy.UploadSeconds)*time.Second)
 			}
 		case <-heartbeatTicker.C:
+			if isPermanent() {
+				continue
+			}
 			stats := queue.Stats()
 			current := state.get()
 			age := int(time.Since(policy.ServerTime).Seconds())
@@ -348,7 +543,15 @@ func RunService(ctx context.Context, config Config) error {
 				age = 86400
 			}
 			health := Heartbeat{Version: 2, Helper: current.Helper, Extension: "missing", State: current.State, PolicyVersion: policy.PolicyVersion, PolicyAgeSeconds: age, QueueEvents: stats.Events, QueueBytes: stats.Bytes, LostEvents: stats.LostEvents, LossEpoch: stats.Epoch, LastError: current.LastError}
-			_ = client.Heartbeat(ctx, credential.Token, health)
+			heartbeatError := client.Heartbeat(ctx, credential.Token, health)
+			if IsCredentialRejected(heartbeatError) {
+				stopCollection("revoked", "unavailable", "credential", true)
+			} else if IsIntegrityRejected(heartbeatError) {
+				// The server refuses inconsistent loss counters until an administrator recovers the device.
+				state.update(func(value *Status) { value.LastError = "integrity" })
+			} else if heartbeatError != nil {
+				state.update(func(value *Status) { value.LastError = "network" })
+			}
 			state.update(func(value *Status) { value.QueueEvents = stats.Events; value.LostEvents = stats.LostEvents })
 		}
 	}
@@ -369,6 +572,24 @@ func CurrentSessionBinding(config Config) (SessionBinding, error) {
 		return SessionBinding{}, err
 	}
 	return SessionBinding{UserSID: config.UserSID, SessionID: session, ServiceSID: serviceIdentity, ServicePath: config.ServicePath}, nil
+}
+
+// errCollectionStopped means the service declined a sample on purpose (revoked, integrity, or no usable policy).
+var errCollectionStopped = errors.New("service stopped collection")
+
+// applyServiceStatus shows a stopped service state to the employee; other states come from the helper's own samples.
+func applyServiceStatus(value *Status, reported *Status) {
+	if reported == nil || validateStatus(*reported) != nil {
+		return
+	}
+	switch reported.State {
+	case "revoked", "error", "policy_unavailable":
+		value.State = reported.State
+		value.Policy = reported.Policy
+		value.LastError = reported.LastError
+	}
+	value.QueueEvents = reported.QueueEvents
+	value.LostEvents = reported.LostEvents
 }
 
 func RunHelper(ctx context.Context, binding SessionBinding) error {
@@ -414,6 +635,7 @@ func RunHelper(ctx context.Context, binding SessionBinding) error {
 					value.Helper = "healthy"
 					value.Policy = "current"
 					value.LastError = "none"
+					applyServiceStatus(value, reply.Status)
 				})
 				nonce := reply.Nonce
 				send := func(message *HelperMessage) error {
@@ -426,7 +648,15 @@ func RunHelper(ctx context.Context, binding SessionBinding) error {
 					if readError := ReadFrame(connection, &acknowledgement); readError != nil {
 						return readError
 					}
-					if acknowledgement.Nonce != nonce || acknowledgement.Sequence != message.Sequence || acknowledgement.State != "acknowledged" {
+					if acknowledgement.Nonce != nonce || acknowledgement.Sequence != message.Sequence {
+						return errors.New("invalid service acknowledgement")
+					}
+					if acknowledgement.State == "stopped" {
+						// The sequence is not advanced: the service recorded nothing for this message.
+						status.update(func(value *Status) { applyServiceStatus(value, acknowledgement.Status) })
+						return errCollectionStopped
+					}
+					if acknowledgement.State != "acknowledged" {
 						return errors.New("invalid service acknowledgement")
 					}
 					sequence++
@@ -434,8 +664,14 @@ func RunHelper(ctx context.Context, binding SessionBinding) error {
 				}
 				if pending != nil {
 					err = send(pending)
+					if errors.Is(err, errCollectionStopped) {
+						pending = nil
+					}
 					if err != nil {
 						connection.Close()
+						if errors.Is(err, errCollectionStopped) {
+							waitContext(helperContext, time.Minute)
+						}
 						continue
 					}
 					pending = nil
@@ -444,15 +680,23 @@ func RunHelper(ctx context.Context, binding SessionBinding) error {
 					message := &HelperMessage{Version: 1, Nonce: nonce, Sequence: sequence + 1, MessageID: token(), HelperInstance: instance, Kind: "samples", Samples: []Sample{sample}}
 					pending = message
 					if sendError := send(message); sendError != nil {
+						if errors.Is(sendError, errCollectionStopped) {
+							// Collection is off by the service's decision; this sample is intentionally not kept.
+							pending = nil
+						}
 						return sendError
 					}
 					pending = nil
-					status.update(func(value *Status) { value.State = safeState(sample) })
+					status.update(func(value *Status) { value.State = safeState(sample, *reply.Policy) })
 					return nil
 				})
 			}
 		}
 		connection.Close()
+		if errors.Is(err, errCollectionStopped) {
+			// Check back once a minute instead of reconnecting after every sample.
+			waitContext(helperContext, time.Minute)
+		}
 		if helperContext.Err() != nil {
 			select {
 			case statusError := <-statusResult:

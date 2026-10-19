@@ -77,7 +77,7 @@ docker compose --project-directory /home/husain/cherrysecurity-m0 run --rm tools
 docker compose --project-directory /home/husain/cherrysecurity-m0 --profile browser-test up -d api-test web-test
 ```
 
-The fixture command creates a random test-owner password and writes it to a private, ignored fixture file. It refuses to overwrite credentials or an existing test owner. Reuse that file for repeat browser runs; don't reseed the owner. The migration command grants the runtime role access to the test schema; the test API uses the same restricted role as the real API. Transfer the fixture securely to the ignored Windows artifact directory:
+The fixture command creates a random test-owner password and writes it to a private, ignored fixture file. It refuses to overwrite credentials or an existing test owner. Reuse that file for repeat browser runs; don't reseed the owner. Rerun the migration command whenever the API image moves to a newer schema (the test database is not migrated by the real deployment), otherwise `api-test` refuses to start. The migration command grants the runtime role access to the test schema; the test API uses the same restricted role as the real API. Transfer the fixture securely to the ignored Windows artifact directory:
 
 ```powershell
 scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$env:USERPROFILE\.ssh\cherrysecurity_kali_ed25519" husain@192.168.193.129:/home/husain/cherrysecurity-m0/backend/browser-fixture.json D:\Cherry-security\artifacts\browser-fixture.json

@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"time"
 
 	"cherrysecurity/agent/internal/agent"
 	"golang.org/x/sys/windows/svc"
 )
+
+const pbtAPMSuspend = 0x4 // PBT_APMSUSPEND: the system is about to sleep.
 
 type handler struct{ config agent.Config }
 
@@ -17,9 +20,12 @@ func (service handler) Execute(_ []string, requests <-chan svc.ChangeRequest, ch
 	changes <- svc.Status{State: svc.StartPending}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	events := make(chan agent.SystemBoundary, 8)
+	config := service.config
+	config.SystemEvents = events
 	done := make(chan error, 1)
-	go func() { done <- agent.RunService(ctx, service.config) }()
-	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	go func() { done <- agent.RunService(ctx, config) }()
+	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
 	for {
 		select {
 		case request := <-requests:
@@ -32,6 +38,14 @@ func (service handler) Execute(_ []string, requests <-chan svc.ChangeRequest, ch
 					return true, 1
 				}
 				return false, 0
+			case svc.PowerEvent:
+				if request.EventType == pbtAPMSuspend {
+					// Never block the control handler; a full buffer drops only this boundary.
+					select {
+					case events <- agent.SystemBoundary{State: "suspended", At: time.Now().UTC()}:
+					default:
+					}
+				}
 			case svc.Interrogate:
 				changes <- request.CurrentStatus
 			}

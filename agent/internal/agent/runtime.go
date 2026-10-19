@@ -154,9 +154,13 @@ func (engine *Engine) ObserveService(observation ServiceObservation) error {
 }
 
 func (engine *Engine) MarkHelperMissing(at time.Time, monotonic time.Duration, session string) error {
+	return engine.MarkSystemBoundary(at, monotonic, session, "helper_missing")
+}
+
+func (engine *Engine) MarkSystemBoundary(at time.Time, monotonic time.Duration, session, state string) error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	if at.IsZero() || monotonic < 0 || session == "" || len(session) > 128 {
+	if at.IsZero() || monotonic < 0 || session == "" || len(session) > 128 || (state != "helper_missing" && state != "suspended" && state != "logged_out" && state != "locked") {
 		return errors.New("invalid helper loss boundary")
 	}
 	policy := engine.timeline.checkpoint.Policy
@@ -164,7 +168,7 @@ func (engine *Engine) MarkHelperMissing(at time.Time, monotonic time.Duration, s
 		return errors.New("policy unavailable or expired")
 	}
 	candidate := &Timeline{checkpoint: engine.timeline.Checkpoint(), restored: engine.timeline.restored}
-	events, err := candidate.Observe(Sample{At: at, Monotonic: monotonic, State: "helper_missing", Session: session})
+	events, err := candidate.Observe(Sample{At: at, Monotonic: monotonic, State: state, Session: session})
 	if err != nil {
 		return err
 	}

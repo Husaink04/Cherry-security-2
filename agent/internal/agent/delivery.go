@@ -26,7 +26,8 @@ func deliverGroup(ctx context.Context, queue *Queue, client *Client, credential 
 		return queue.Acknowledge(events, ack.IDs)
 	}
 	var failure *HTTPError
-	if !errors.As(err, &failure) || (failure.Status != 400 && failure.Status != 422) {
+	// 409 (conflicting event ID or overlapping interval) is a per-record rejection like 400/422.
+	if !errors.As(err, &failure) || (failure.Status != 400 && failure.Status != 409 && failure.Status != 422) {
 		return err
 	}
 	if len(events) == 1 {

@@ -53,6 +53,8 @@ IP addresses, free resources, versions, usernames, and paths are specific to thi
 13. Deployed the dedicated Compose stack, applied two migrations, completed automated acceptance and restore tests, and bootstrapped the actual Product Owner through the guest terminal. Passwords were entered locally and were not stored in source.
 14. During M1 source work, the owner explicitly chose to keep Kali SSH stopped. Windows source checks use the approved project-local Go toolchain; no M1 deployment has been synchronized to Kali.
 15. On 2026-10-18 the owner started SSH and approved deploying `main` (`14a0145`). The database was backed up (`backups/cherrysecurity-20261018T123437Z-*.dump`, checked with `pg_restore --list`) and the previous images were tagged `:m0-rollback`. A `git archive` of `main` was synced, which excludes uncommitted work. `migrate`, `api` and `web` were rebuilt, and migrations 003 and 004 were applied in one transaction. Verified results: schema 4, seven tables with forced row-level security, a no-login `cherry_auth` role, a restricted `cherryapp` that sees no rows without a tenant scope, readiness 200, and a console sign-in the owner confirmed.
+16. Later on 2026-10-18 the agent HTTPS ingress was deployed. `agent-ingress` runs `nginxinc/nginx-unprivileged:1.28-alpine` as `1000:1000` (so it can read the mode-600 key without extra capabilities) and listens only on `192.168.193.129:8443`; `AGENT_BIND_IP=192.168.193.129` was added to `.env`. `scripts/prepare-agent-tls.py` created a private ECDSA P-256 CA (expires 2027-10-18, SHA-256 fingerprint `45:F4:3C:14:62:61:25:5D:E5:0D:50:89:B6:D5:62:14:83:07:83:80:14:15:07:0C:F7:2D:7B:82:61:A0:7C:61`) and a 30-day server certificate for that IP only (expires 2026-11-17) in `secrets/agent-tls` (directories 700, files 600). A first Ed25519 set is kept in `secrets/agent-tls-ed25519-20261018`; Windows Schannel cannot negotiate Ed25519. Verified from Kali, with a Go client on Windows and with Windows `curl.exe`: the policy route returns 401 without a device token, other routes 404, wrong methods 405, TLS 1.3, and untrusted CAs are rejected. The console port 8080 and PostgreSQL are not reachable from Windows. No firewall change was needed. The public CA copy for installation is `D:\Cherry-security\artifacts\agent\agent-ca.crt`.
+17. On 2026-10-18 the owner approved Batch C on this Windows 11 Pro PC for user `husain\husai` (SID `S-1-5-21-4178743217-2586328297-2924519820-1001`). Installs ran in an administrator PowerShell, some through a UAC prompt the owner approved, with output logged under `artifacts\agent`. Four failed attempts each rolled back cleanly and led to the fixes recorded in the M1 ledger. The final build `artifacts\agent\batch-c5` (commit `5e5c246`) is installed and enrolled with an owner-issued key; the first enrolled device was revoked before reinstalling. After a Kali reboot all CherrySecurity containers, including `agent-ingress`, came back without intervention, but SSH and the console tunnel had to be restarted.
 
 ## 4. SSH identity and connection
 
@@ -143,6 +145,7 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 - The initial Product Owner exists. Sign in using the email and password entered during bootstrap. Bootstrap refuses to overwrite an existing owner. Customer users and device credentials remain separate from Kali SSH accounts.
 - Database data persists in a project-owned volume; private environment credentials remain in the guest's ignored mode-600 `.env`. Never remove the volume or publish this file.
 - Assess available memory during builds because this VM also runs unrelated containers. Do not resize the VM or shut down other workloads automatically.
+- Windows `curl.exe` uses Schannel, which cannot check revocation for the private agent CA; add `--ssl-no-revoke` together with `--cacert D:\Cherry-security\artifacts\agent\agent-ca.crt` when inspecting `https://192.168.193.129:8443`.
 - After a VM reboot the API may restart once while PostgreSQL starts; that is expected. nginx looks up the API again within 10 seconds, so the console recovers without a manual restart.
 - Rollback point for the 2026-10-18 deployment: the backup above plus the `cherrysecurity-m0-{api,migrate,web}:m0-rollback` images. Restoring over the live database is a manual, separately approved step; `scripts/restore.sh` restores only into a new test database.
 
@@ -156,11 +159,11 @@ Do not run `docker system prune`, stop unrelated containers, overwrite SSH confi
 | SSH host verification and key authorization | Verified |
 | Docker/Compose installation and daemon access | Verified |
 | Backend / React / PostgreSQL deployment | Running `main`, schema version 4 with row-level security |
-| Agent TLS ingress (rest of Batch B) | Not deployed; certificate, listener, NAT binding and firewall approval still required |
+| Agent TLS ingress (rest of Batch B) | Running on `192.168.193.129:8443`; server certificate expires 2026-11-17, renew by retiring `secrets/agent-tls` and rerunning `scripts/prepare-agent-tls.py` |
 | M0 acceptance tests / backup restore | Passed; see linked verification report |
 | Actual Product Owner | Created interactively; database count verified |
-| M1 Windows agent source | Service/helper/control source and unsigned local artifacts built on branch `m1`; see M1 results |
-| Real Windows monitoring agent | Not installed; Batch C approval is still required |
+| M1 Windows agent source | On `main`; installed build `artifacts\agent\batch-c6` from `fec4c6e` (unsigned), reached by in-place upgrade; see M1 results |
+| Real Windows monitoring agent | Installed and enrolled on the owner's PC for `husain\husai`; helper healthy and uploading. Batch D (activity, lock/suspend, outage, revocation, eight-hour measurement) still requires approval |
 
 Use the [M0 operations guide](M0-DEVELOPMENT.md), [M0 results](testing/m0-results.md), [M1 Windows operations guide](M1-WINDOWS-OPERATIONS.md), and [M1 results](testing/m1-results.md). M1 deployment and endpoint acceptance remain separately approved batches.
 

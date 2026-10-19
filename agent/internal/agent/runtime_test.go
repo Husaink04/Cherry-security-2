@@ -104,3 +104,29 @@ func TestHelperDeathDoesNotFabricateActivity(t *testing.T) {
 		t.Fatalf("helper loss attribution: %+v", events)
 	}
 }
+
+func TestEngineRecordsExplicitSystemBoundary(t *testing.T) {
+	policy := testPolicy()
+	queue, err := OpenQueue(filepath.Join(t.TempDir(), "queue.db"), 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	engine, err := NewEngine(queue, policy, policy.ServerTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := HelperMessage{Version: 1, Nonce: token(), MessageID: token(), HelperInstance: token(), Sequence: 1, Kind: "samples", Samples: []Sample{{At: policy.ServerTime, State: "active", App: "editor.exe", Session: "console"}}}
+	if err = engine.ObserveMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.MarkSystemBoundary(policy.ServerTime.Add(time.Second), time.Second, "console", "suspended"); err != nil {
+		t.Fatal(err)
+	}
+	if state := engine.Checkpoint().Last.State; state != "suspended" {
+		t.Fatalf("system boundary recorded as %q", state)
+	}
+	if err = engine.MarkSystemBoundary(policy.ServerTime.Add(2*time.Second), 2*time.Second, "console", "invented"); err == nil {
+		t.Fatal("invalid system boundary accepted")
+	}
+}

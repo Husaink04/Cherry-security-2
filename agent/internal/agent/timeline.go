@@ -120,17 +120,17 @@ func (timeline *Timeline) Observe(sample Sample) ([]Event, error) {
 	case sample.Session != previous.Session:
 		period.Kind = "gap"
 		period.Reason = "unsupported_session"
+	case previous.State == "locked":
+		period.Kind = "locked"
+	case previous.State != "active":
+		period.Kind = "gap"
+		period.Reason = previous.State
 	case drift > 2*time.Second || drift < -2*time.Second:
 		period.Kind = "gap"
 		period.Reason = "clock_discontinuity"
 	case delta > 5*time.Second:
 		period.Kind = "gap"
 		period.Reason = "helper_missing"
-	case previous.State == "locked":
-		period.Kind = "locked"
-	case previous.State != "active":
-		period.Kind = "gap"
-		period.Reason = previous.State
 	case previous.App == "":
 		period.Kind = "gap"
 		period.Reason = "process_unavailable"

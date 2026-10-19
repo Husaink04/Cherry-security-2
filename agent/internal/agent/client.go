@@ -25,6 +25,10 @@ func IsCredentialRejected(err error) bool {
 	var failure *HTTPError
 	return errors.As(err, &failure) && failure.Status == 401
 }
+func IsIntegrityRejected(err error) bool {
+	var failure *HTTPError
+	return errors.As(err, &failure) && failure.Status == 409
+}
 
 func NewClient(baseURL string, caPEM []byte) (*Client, error) {
 	parsed, err := url.Parse(baseURL)
